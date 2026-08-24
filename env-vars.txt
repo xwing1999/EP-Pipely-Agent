@@ -1,0 +1,48 @@
+# Reference only — Railway does NOT read this file. Paste real values into
+# Railway's Variables tab directly. Never put real secrets in this file or
+# commit them to git.
+
+# Shared secret for /admin endpoints.
+API_KEY=
+
+# Xero OAuth app for Everest Plunge's OWN Xero organisation. Can reuse the
+# SAME Xero app (Client ID/Secret) as everest-plunge-shopify-xero-agent if
+# you'd rather manage one Xero app for the whole business — just make sure
+# the redirect URI below matches THIS service's URL, since Xero apps can
+# have multiple redirect URIs registered. Do not reuse a Kiwiseal Xero app.
+XERO_CLIENT_ID=
+XERO_CLIENT_SECRET=
+XERO_REDIRECT_URI=
+
+# Leave blank on first deploy — filled in via the /oauth/start flow, same as
+# every other Xero agent in this project.
+XERO_TENANT_ID=
+XERO_REFRESH_TOKEN=
+XERO_TOKEN_FILE=/data/xero-token.json
+
+# Pipely (GoHighLevel) — Everest Plunge's OWN location, not Kiwiseal's.
+# Find the location ID in Pipely's Settings > Business Info, and generate
+# an API key under Settings > API Keys (or Private Integrations, depending
+# on your Pipely plan).
+PIPELY_API_KEY=
+PIPELY_LOCATION_ID=
+PIPELY_BASE_URL=https://services.leadconnectorhq.com
+
+# How far back to look for "won" Pipely deals on each check. Deals won
+# earlier than this are assumed already reconciled (or already dealt with)
+# and are silently ignored, not flagged.
+RECONCILE_LOOKBACK_DAYS=30
+
+# How often to re-run the reconciliation check, in minutes.
+CHECK_INTERVAL_MINUTES=60
+
+# Dollar tolerance when comparing a Pipely deal's value against a Xero
+# invoice total — small differences (rounding, a discount applied in Xero
+# but not reflected in the Pipely deal value) shouldn't count as a mismatch.
+VALUE_TOLERANCE=1
+
+# Where the current mismatch snapshot is persisted (survives restarts if a
+# Railway volume is mounted here).
+MISMATCH_FILE=/data/pipely-xero-mismatches.json
+
+PORT=3008

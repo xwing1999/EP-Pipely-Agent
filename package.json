@@ -1,0 +1,15 @@
+{
+  "name": "everest-plunge-pipely-xero-agent",
+  "version": "1.0.0",
+  "description": "Reconciliation service for Everest Plunge: checks that won Pipely deals have a matching invoice in Xero and flags anything that doesn't reconcile. Read-only against both systems — does not create or modify invoices. Automating invoice creation from Pipely deals is a separate, not-yet-confirmed decision (it would replace the current manual step where a rep raises the invoice inside Pipely).",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "dotenv": "^16.4.5"
+  }
+}
