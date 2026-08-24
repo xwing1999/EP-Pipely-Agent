@@ -9,10 +9,12 @@ app.use(express.json());
 // ---------------------------------------------------------------------------
 // AUTH — shared-secret pattern, same as every other agent in this project.
 // /oauth/* stays exempt (one-time browser flow, no header a redirect can
-// carry).
+// carry), and /webhooks/* stays exempt too — GoHighLevel's workflow
+// webhook action has its own separate secret check (verifyPipelyWebhookSecret,
+// further down) rather than sending an x-api-key header.
 // ---------------------------------------------------------------------------
 app.use((req, res, next) => {
-  if (req.path === '/health' || req.path.startsWith('/oauth/')) return next();
+  if (req.path === '/health' || req.path.startsWith('/oauth/') || req.path.startsWith('/webhooks/')) return next();
   const provided = req.header('x-api-key');
   if (!process.env.API_KEY || provided !== process.env.API_KEY) {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -21,12 +23,9 @@ app.use((req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
-// XERO OAUTH TOKEN MANAGEMENT — same pattern as wellington-xero-agent.
-// READ-ONLY scopes only: this agent checks reconciliation, it never writes
-// to Xero. If you later want it to auto-create the invoice instead of just
-// flagging a mismatch, that's a bigger process change (it replaces the
-// current manual "raise the invoice inside Pipely" step) — confirm that
-// separately before adding write scopes here.
+// XERO OAUTH TOKEN MANAGEMENT — same pattern as wellington-xero-agent. Both
+// read (reconciliation) and write (deposit invoicing, added 2026-08-24 —
+// see "DEPOSIT INVOICING" below) scopes are requested.
 // ---------------------------------------------------------------------------
 const TOKEN_FILE = process.env.XERO_TOKEN_FILE || '/data/xero-token.json';
 
@@ -104,31 +103,39 @@ async function getAccessToken() {
   return tokenState.accessToken;
 }
 
-async function xeroRequest(pathSegment, { params, headers = {} } = {}) {
+async function xeroRequest(pathSegment, { method = 'GET', params, body, headers = {} } = {}) {
   const token = await getAccessToken();
   const url = new URL(pathSegment, 'https://api.xero.com/api.xro/2.0/');
   if (params) Object.entries(params).forEach(([k, v]) => v != null && url.searchParams.set(k, v));
   const res = await fetch(url, {
+    method,
     headers: {
       Authorization: `Bearer ${token}`,
       'Xero-tenant-id': tokenState.tenantId,
       Accept: 'application/json',
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
       ...headers
-    }
+    },
+    body: body ? JSON.stringify(body) : undefined
   });
   if (!res.ok) {
-    throw new Error(`Xero API error ${res.status} on GET ${pathSegment}: ${await res.text()}`);
+    throw new Error(`Xero API error ${res.status} on ${method} ${pathSegment}: ${await res.text()}`);
   }
+  // Some endpoints (e.g. Invoices/{id}/Email) return 204 with an empty body
+  // on success — res.json() throws on that. Read as text first.
   const text = await res.text();
   return text ? JSON.parse(text) : {};
 }
 
+// WRITE scopes — this agent now also creates/sends deposit invoices (see
+// "DEPOSIT INVOICING" below, added 2026-08-24 once Xavier confirmed he
+// wants this automated), not just reading for reconciliation.
 app.get('/oauth/start', (_req, res) => {
   const params = new URLSearchParams({
     response_type: 'code',
     client_id: process.env.XERO_CLIENT_ID,
     redirect_uri: process.env.XERO_REDIRECT_URI,
-    scope: 'accounting.invoices.read accounting.contacts offline_access',
+    scope: 'accounting.transactions accounting.contacts offline_access',
     state: 'setup'
   });
   res.redirect(`https://login.xero.com/identity/connect/authorize?${params}`);
@@ -220,6 +227,133 @@ async function fetchPipelyContact(contactId) {
   if (!res.ok) throw new Error(`Pipely contact lookup error ${res.status}: ${await res.text()}`);
   const data = await res.json();
   return data.contact ?? data;
+}
+
+async function fetchPipelyOpportunity(opportunityId) {
+  const res = await fetch(`${PIPELY_BASE_URL}/opportunities/${opportunityId}`, {
+    headers: { Authorization: `Bearer ${process.env.PIPELY_API_KEY}`, Version: '2021-07-28' }
+  });
+  if (!res.ok) throw new Error(`Pipely opportunity lookup error ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+  return data.opportunity ?? data;
+}
+
+// ---------------------------------------------------------------------------
+// DEPOSIT INVOICING (added 2026-08-24) — Xavier confirmed the booking
+// deposit invoice should go out automatically the moment a deal is marked
+// accepted: either the client accepts the Qwilr proposal, or a rep drags
+// the Pipely opportunity into the "send deposit" pipeline stage. Qwilr has
+// no confirmed API/webhook access yet, so only the Pipely-stage trigger is
+// wired up below. GoHighLevel's own Workflow automations can fire a
+// webhook on a pipeline stage change — that's the intended trigger source
+// for /webhooks/pipely/deposit-trigger, not polling.
+//
+// Deposit amount is DEPOSIT_PERCENTAGE (default 50%) of the opportunity's
+// monetaryValue. This creates an ordinary AUTHORISED (unpaid) invoice and
+// emails it — unlike the Shopify agent, it does NOT mark it paid, because
+// the deposit hasn't actually been paid yet at trigger time; that happens
+// later via the client's bank transfer and Xero's own reconciliation.
+//
+// The final 50% payment ("the week before we ship, must be paid before
+// sending") is NOT built here — it depends on a per-order ship date that
+// lives in the batch-tab spreadsheet, whose real layout isn't confirmed
+// yet. Don't guess that part; it's a separate build once the sheet export
+// is in hand.
+// ---------------------------------------------------------------------------
+const DEPOSIT_PERCENTAGE = Number(process.env.DEPOSIT_PERCENTAGE ?? 0.5);
+
+async function findOrCreateXeroContactForPipely(contact) {
+  const email = contact.email;
+  if (!email) throw new Error('Pipely contact has no email — cannot match/create a Xero contact.');
+
+  const existing = await xeroRequest('Contacts', { params: { where: `EmailAddress=="${email}"` } });
+  if (existing.Contacts?.length) return existing.Contacts[0].ContactID;
+
+  const created = await xeroRequest('Contacts', {
+    method: 'PUT',
+    body: {
+      Contacts: [{
+        Name: [contact.firstName, contact.lastName].filter(Boolean).join(' ') || contact.name || email,
+        EmailAddress: email,
+        Addresses: contact.address1 ? [{
+          AddressType: 'STREET',
+          AddressLine1: contact.address1,
+          City: contact.city || '',
+          Region: contact.state || '',
+          PostalCode: contact.postalCode || '',
+          Country: contact.country || ''
+        }] : []
+      }]
+    }
+  });
+  return created.Contacts[0].ContactID;
+}
+
+async function createDepositInvoice(opportunity, contact) {
+  const reference = `Deposit - ${opportunity.id}`;
+
+  // Idempotency: this webhook could fire more than once for the same
+  // stage-change (GHL workflow re-runs, a manual re-trigger, etc.) — check
+  // Xero for an invoice with this Reference before creating a duplicate.
+  const already = await xeroRequest('Invoices', { params: { where: `Reference=="${reference}"` } });
+  if (already.Invoices?.length) {
+    console.log(`Deposit invoice already exists for opportunity ${opportunity.id} — skipping.`);
+    return already.Invoices[0];
+  }
+
+  const dealValue = Number(opportunity.monetaryValue ?? 0);
+  if (dealValue <= 0) throw new Error(`Opportunity ${opportunity.id} has no positive monetaryValue — cannot compute a deposit.`);
+  const depositAmount = Math.round(dealValue * DEPOSIT_PERCENTAGE * 100) / 100;
+
+  const contactId = await findOrCreateXeroContactForPipely(contact);
+  const today = new Date().toISOString().slice(0, 10);
+
+  const invoicePayload = {
+    Type: 'ACCREC',
+    Contact: { ContactID: contactId },
+    LineAmountTypes: 'Inclusive',
+    Date: today,
+    DueDate: today,
+    Reference: reference,
+    Status: 'AUTHORISED',
+    LineItems: [{
+      Description: `${Math.round(DEPOSIT_PERCENTAGE * 100)}% Booking Deposit — ${opportunity.name ?? opportunity.id}`,
+      Quantity: 1,
+      UnitAmount: depositAmount,
+      AccountCode: process.env.XERO_SALES_ACCOUNT_CODE,
+      TaxType: process.env.XERO_TAX_TYPE
+    }]
+  };
+
+  const created = await xeroRequest('Invoices', { method: 'PUT', body: { Invoices: [invoicePayload] } });
+  const invoice = created.Invoices[0];
+
+  // Sends via Xero's own email delivery, same as the Shopify agent — not
+  // yet exercised against a real Xero org at write time, verify once
+  // OAuth is connected.
+  await xeroRequest(`Invoices/${invoice.InvoiceID}/Email`, { method: 'POST' });
+
+  return invoice;
+}
+
+const DEPOSIT_FAILED_LOG_FILE = process.env.DEPOSIT_FAILED_LOG_FILE || '/data/deposit-invoice-failures.json';
+
+function loadDepositFailedLog() {
+  try { return JSON.parse(fs.readFileSync(DEPOSIT_FAILED_LOG_FILE, 'utf8')); } catch { return []; }
+}
+function appendDepositFailedLog(entry) {
+  const log = loadDepositFailedLog();
+  log.push({ ...entry, at: new Date().toISOString() });
+  try {
+    fs.mkdirSync(path.dirname(DEPOSIT_FAILED_LOG_FILE), { recursive: true });
+    fs.writeFileSync(DEPOSIT_FAILED_LOG_FILE, JSON.stringify(log, null, 2));
+  } catch (err) {
+    console.warn('Could not persist deposit-failure log to disk:', err.message);
+  }
+}
+
+function extractOpportunityId(body) {
+  return body?.opportunityId || body?.opportunity_id || body?.id || body?.opportunity?.id || null;
 }
 
 // ---------------------------------------------------------------------------
@@ -351,7 +485,88 @@ app.post('/admin/run-check', async (_req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// DEPOSIT INVOICE WEBHOOK — intended trigger is a GoHighLevel Workflow
+// automation (configured in Pipely) that fires on the opportunity being
+// dragged into the "send deposit" pipeline stage, with this URL as a
+// Webhook action step. Protected by a shared secret since GHL workflow
+// webhook actions typically only let you set a URL (so the secret travels
+// as a query param) — accepts either that or a header, whichever your
+// workflow setup supports.
+//
+// The payload shape GHL actually sends from a workflow webhook action is
+// NOT confirmed — rather than trust a guessed field name, this pulls
+// whatever opportunity ID it can find from a few likely shapes, then
+// fetches the real opportunity + contact from Pipely's API directly
+// (already-proven endpoints) instead of trusting webhook body fields for
+// anything that matters financially.
+// ---------------------------------------------------------------------------
+function verifyPipelyWebhookSecret(req) {
+  if (!process.env.PIPELY_WEBHOOK_SECRET) return false;
+  const provided = req.query.token || req.header('x-webhook-secret');
+  return provided === process.env.PIPELY_WEBHOOK_SECRET;
+}
+
+app.post('/webhooks/pipely/deposit-trigger', async (req, res) => {
+  if (!verifyPipelyWebhookSecret(req)) {
+    console.warn('Rejected deposit-trigger webhook with invalid/missing secret.');
+    return res.status(401).send('Invalid signature');
+  }
+
+  const opportunityId = extractOpportunityId(req.body);
+  if (!opportunityId) {
+    console.warn('Deposit-trigger webhook fired with no recognisable opportunity ID in the payload:', JSON.stringify(req.body));
+    return res.status(400).send('No opportunityId found in payload');
+  }
+
+  // Ack immediately, same reasoning as the Shopify webhook — the Pipely +
+  // Xero calls below can exceed a typical webhook timeout, and GHL will
+  // not retry this delivery either way once it gets a 200.
+  res.status(200).send('OK');
+
+  try {
+    const opportunity = await fetchPipelyOpportunity(opportunityId);
+    const contact = await fetchPipelyContact(opportunity.contactId);
+    const invoice = await createDepositInvoice(opportunity, contact);
+    console.log(`Opportunity ${opportunityId}: deposit invoice ${invoice.InvoiceNumber} (${invoice.InvoiceID}) ready.`);
+  } catch (err) {
+    console.error(`Opportunity ${opportunityId} deposit invoice FAILED — flagging, not retrying automatically:`, err.message);
+    appendDepositFailedLog({ opportunityId, error: err.message });
+  }
+});
+
+app.get('/admin/deposit-failures', (_req, res) => {
+  res.json({ failures: loadDepositFailedLog() });
+});
+
+// Reprocess a flagged deposit-invoice failure after the underlying problem
+// is fixed. Never automatic, per the project's flag-and-stop rule.
+app.post('/admin/replay-deposit', async (req, res) => {
+  const { opportunityId } = req.body;
+  if (!opportunityId) return res.status(400).json({ error: 'opportunityId is required' });
+
+  const log = loadDepositFailedLog();
+  const entry = log.find((e) => e.opportunityId === opportunityId && !e.resolved);
+  if (!entry) return res.status(404).json({ error: `No unresolved deposit failure found for opportunity ${opportunityId}` });
+
+  try {
+    const opportunity = await fetchPipelyOpportunity(opportunityId);
+    const contact = await fetchPipelyContact(opportunity.contactId);
+    const invoice = await createDepositInvoice(opportunity, contact);
+    entry.resolved = true;
+    entry.resolvedAt = new Date().toISOString();
+    try {
+      fs.writeFileSync(DEPOSIT_FAILED_LOG_FILE, JSON.stringify(log, null, 2));
+    } catch (err) {
+      console.warn('Could not persist resolved status to disk:', err.message);
+    }
+    res.json({ ok: true, invoiceId: invoice.InvoiceID, invoiceNumber: invoice.InvoiceNumber });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 const port = process.env.PORT || 3008;
-app.listen(port, () => console.log(`Everest Plunge Pipely-Xero Reconciliation Agent listening on :${port}`));
+app.listen(port, () => console.log(`Everest Plunge Pipely-Xero Agent listening on :${port}`));

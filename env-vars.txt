@@ -45,4 +45,23 @@ VALUE_TOLERANCE=1
 # Railway volume is mounted here).
 MISMATCH_FILE=/data/pipely-xero-mismatches.json
 
+# --- Deposit invoicing (added 2026-08-24) ---
+# Shared secret for the deposit-trigger webhook, sent by the GoHighLevel
+# Workflow action either as ?token=... on the URL, or as an
+# x-webhook-secret header, whichever your workflow setup supports. This is
+# separate from API_KEY above — GHL's workflow webhook action likely can't
+# send a custom x-api-key header the way Retool/Business Brain can.
+PIPELY_WEBHOOK_SECRET=
+
+# Fraction of the deal value invoiced as the booking deposit.
+DEPOSIT_PERCENTAGE=0.5
+
+# Reuses the same chart-of-accounts values as everest-plunge-shopify-xero-
+# agent — fill in the real codes from your Xero org, don't guess.
+XERO_SALES_ACCOUNT_CODE=
+XERO_TAX_TYPE=
+
+# Where flagged deposit-invoice failures are persisted.
+DEPOSIT_FAILED_LOG_FILE=/data/deposit-invoice-failures.json
+
 PORT=3008
