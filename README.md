@@ -1,13 +1,37 @@
 # Everest Plunge Pipely ↔ Xero Agent
 
-Two separate jobs, both between Pipely and Xero:
+Three jobs, all between Pipely and Xero:
 
 1. **Reconciliation** (read-only) — checks that won Pipely deals have a
    matching invoice in Xero, flags anything that doesn't line up.
 2. **Deposit invoicing** (write) — creates and emails a booking-deposit
    Xero invoice automatically when a deal reaches the "send deposit" stage
-   in Pipely. Added 2026-08-24 once Xavier confirmed this should be
-   automated, not just checked.
+   in Pipely. Added 2026-08-24.
+3. **Final payment invoicing** (write, human-triggered) — creates and
+   emails the remaining 50% once someone decides an order is ready to
+   release. Added 2026-08-31 alongside the stock sheet agent's release
+   gate — see below.
+
+## Final payment invoicing
+
+`POST /admin/create-final-invoice` — body `{ "opportunityId": "..." }`.
+Requires the deposit invoice to already exist (refuses to invent a final
+amount for a deal that was never deposit-invoiced). Computes the final
+amount as the same `DEPOSIT_PERCENTAGE` split off the deal value, not
+"deal value minus whatever the deposit invoice says now" — so it can't
+drift if the deposit invoice was edited after the fact.
+
+**Deliberately not on any automatic schedule.** Nothing here knows a real
+ship date yet — that lives in the still-unconfirmed batch tabs — so
+there's no reliable "the week before shipping" trigger to hang this off
+of. A human calls this (via the ops console) once they've decided an order
+is ready. After creating the invoice, this also tells
+`everest-plunge-stock-sheet-agent` the deal's final payment status is now
+"Invoiced" (via its `External Ref`, best-effort, doesn't block on failure)
+— that agent then refuses to let the order be marked sent until someone
+confirms the payment actually cleared and calls
+`POST /admin/mark-final-payment-received` there. That's the real release
+gate; this agent only creates the invoice.
 
 ## Reconciliation
 

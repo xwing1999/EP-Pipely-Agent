@@ -336,6 +336,79 @@ async function createDepositInvoice(opportunity, contact) {
   return invoice;
 }
 
+// ---------------------------------------------------------------------------
+// FINAL PAYMENT INVOICING (added 2026-08-31) — the other 50%, per Xavier:
+// "50% booking deposit, 50% final payment the week before we ship, must be
+// paid before sending." Deliberately NOT triggered automatically on any
+// schedule — nothing here knows a real ship date yet (that lives in the
+// still-unconfirmed batch tabs). Triggered by a human via
+// POST /admin/create-final-invoice once they've decided an order is ready
+// to release, from the ops console's ready-to-ship view. Requires the
+// deposit invoice to already exist — refuses to invent a final-payment
+// amount for a deal that was never deposit-invoiced in the first place.
+// ---------------------------------------------------------------------------
+async function createFinalInvoice(opportunity, contact) {
+  const depositReference = `Deposit - ${opportunity.id}`;
+  const finalReference = `Final Payment - ${opportunity.id}`;
+
+  const depositInvoices = await xeroRequest('Invoices', { params: { where: `Reference=="${depositReference}"` } });
+  if (!depositInvoices.Invoices?.length) {
+    throw new Error(`No deposit invoice found for opportunity ${opportunity.id} — cannot create a final invoice before the deposit exists.`);
+  }
+
+  const already = await xeroRequest('Invoices', { params: { where: `Reference=="${finalReference}"` } });
+  if (already.Invoices?.length) {
+    console.log(`Final invoice already exists for opportunity ${opportunity.id} — skipping.`);
+    return already.Invoices[0];
+  }
+
+  const dealValue = Number(opportunity.monetaryValue ?? 0);
+  if (dealValue <= 0) throw new Error(`Opportunity ${opportunity.id} has no positive monetaryValue — cannot compute a final payment.`);
+  // Same percentage split as the deposit, not "deal value minus whatever
+  // the deposit invoice actually says" — keeps deposit + final summing to
+  // exactly the deal value even if the deposit was edited in Xero after
+  // the fact, which "deal value minus deposit invoice total" would not.
+  const finalAmount = Math.round(dealValue * (1 - DEPOSIT_PERCENTAGE) * 100) / 100;
+
+  const contactId = await findOrCreateXeroContactForPipely(contact);
+  const today = new Date().toISOString().slice(0, 10);
+
+  const invoicePayload = {
+    Type: 'ACCREC',
+    Contact: { ContactID: contactId },
+    LineAmountTypes: 'Inclusive',
+    Date: today,
+    DueDate: today,
+    Reference: finalReference,
+    Status: 'AUTHORISED',
+    LineItems: [{
+      Description: `Final Payment — ${opportunity.name ?? opportunity.id}`,
+      Quantity: 1,
+      UnitAmount: finalAmount,
+      AccountCode: process.env.XERO_SALES_ACCOUNT_CODE,
+      TaxType: process.env.XERO_TAX_TYPE
+    }]
+  };
+
+  const created = await xeroRequest('Invoices', { method: 'PUT', body: { Invoices: [invoicePayload] } });
+  const invoice = created.Invoices[0];
+  await xeroRequest(`Invoices/${invoice.InvoiceID}/Email`, { method: 'POST' });
+
+  // Best-effort — tells the stock sheet agent this deal is now waiting on
+  // final payment, so the ops console's release gate can show it as
+  // "Invoiced" rather than "not invoiced". Does not throw: the invoice
+  // above is what actually matters and has already succeeded.
+  if (process.env.STOCK_SHEET_AGENT_URL) {
+    await fetch(`${process.env.STOCK_SHEET_AGENT_URL}/admin/set-final-payment-status`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.STOCK_SHEET_AGENT_API_KEY },
+      body: JSON.stringify({ externalRef: opportunity.id, status: 'Invoiced' })
+    }).catch((err) => console.error(`Opportunity ${opportunity.id}: failed to set final payment status on stock sheet:`, err.message));
+  }
+
+  return invoice;
+}
+
 const DEPOSIT_FAILED_LOG_FILE = process.env.DEPOSIT_FAILED_LOG_FILE || '/data/deposit-invoice-failures.json';
 
 function loadDepositFailedLog() {
@@ -566,7 +639,7 @@ async function flagOrLinkStockForOpportunity(opportunity, contact) {
     // Unreachable until resolveSkuFromOpportunity is implemented for real.
     await callStockSheetAgent('/admin/record-order', { sku, quantity: 1 });
     await callStockSheetAgent('/admin/log-sold-deal', {
-      source: 'Pipely', customerName: contactName || opportunity.name,
+      source: 'Pipely', externalRef: opportunity.id, customerName: contactName || opportunity.name,
       email: contact?.email || '', sku, quantity: 1, dealValue: opportunity.monetaryValue,
       depositStatus: 'Deposit invoiced', notes: `Pipely deal ${opportunity.id}, auto-resolved`
     });
@@ -591,7 +664,7 @@ app.get('/admin/needs-sku-assignment', (_req, res) => {
 // A human supplies the SKU/quantity this deal is actually for. Calls the
 // same two stock-sheet-agent endpoints the Shopify agent already uses.
 app.post('/admin/assign-sku', async (req, res) => {
-  const { opportunityId, sku, quantity } = req.body;
+  const { opportunityId, sku, quantity, allocation, batchReference, expectedDate } = req.body;
   if (!opportunityId || !sku || !quantity) {
     return res.status(400).json({ error: 'opportunityId, sku, and quantity are required' });
   }
@@ -602,9 +675,10 @@ app.post('/admin/assign-sku', async (req, res) => {
   try {
     await callStockSheetAgent('/admin/record-order', { sku, quantity: Number(quantity) });
     await callStockSheetAgent('/admin/log-sold-deal', {
-      source: 'Pipely', customerName: entry.contactName || entry.contactEmail || entry.dealName,
+      source: 'Pipely', externalRef: opportunityId, customerName: entry.contactName || entry.contactEmail || entry.dealName,
       email: entry.contactEmail, sku, quantity: Number(quantity), dealValue: entry.dealValue,
-      depositStatus: 'Deposit invoiced', notes: `Pipely deal ${opportunityId}, SKU assigned manually`
+      depositStatus: 'Deposit invoiced', allocation, batchReference, expectedDate,
+      notes: `Pipely deal ${opportunityId}, SKU assigned manually`
     });
     entry.resolved = true;
     entry.resolvedSku = sku;
@@ -677,6 +751,23 @@ app.post('/admin/replay-deposit', async (req, res) => {
     } catch (err) {
       console.warn('Could not persist resolved status to disk:', err.message);
     }
+    res.json({ ok: true, invoiceId: invoice.InvoiceID, invoiceNumber: invoice.InvoiceNumber });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Human-triggered (see "FINAL PAYMENT INVOICING" above for why this isn't
+// on any automatic schedule) — the ops console's ready-to-ship view calls
+// this once an order's stock is ready and someone's decided it's time to
+// release the final invoice.
+app.post('/admin/create-final-invoice', async (req, res) => {
+  const { opportunityId } = req.body;
+  if (!opportunityId) return res.status(400).json({ error: 'opportunityId is required' });
+  try {
+    const opportunity = await fetchPipelyOpportunity(opportunityId);
+    const contact = await fetchPipelyContact(opportunity.contactId);
+    const invoice = await createFinalInvoice(opportunity, contact);
     res.json({ ok: true, invoiceId: invoice.InvoiceID, invoiceNumber: invoice.InvoiceNumber });
   } catch (err) {
     res.status(500).json({ error: err.message });
