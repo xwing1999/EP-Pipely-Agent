@@ -7,6 +7,23 @@ const app = express();
 app.use(express.json());
 
 // ---------------------------------------------------------------------------
+// KEYED LOCK — added 2026-08-31 after an audit found a real race: without
+// this, two overlapping triggers for the same opportunity (a GHL workflow
+// re-run, or a double-click on "send final invoice") could both pass the
+// "does an invoice already exist?" check before either finished, creating
+// two deposit or two final invoices for one deal. Serializes calls sharing
+// a key within this process — sufficient at this scale (one Railway
+// instance).
+// ---------------------------------------------------------------------------
+const locks = new Map();
+function withLock(key, fn) {
+  const prevTail = locks.get(key) || Promise.resolve();
+  const run = prevTail.then(fn, fn);
+  locks.set(key, run.then(() => {}, () => {}));
+  return run;
+}
+
+// ---------------------------------------------------------------------------
 // AUTH — shared-secret pattern, same as every other agent in this project.
 // /oauth/* stays exempt (one-time browser flow, no header a redirect can
 // carry), and /webhooks/* stays exempt too — GoHighLevel's workflow
@@ -289,16 +306,32 @@ async function findOrCreateXeroContactForPipely(contact) {
   return created.Contacts[0].ContactID;
 }
 
+// Locked by opportunity ID — an audit found that without this, two
+// overlapping triggers (GHL workflow re-run, a manual re-trigger) could
+// both pass the idempotency check below before either finished, creating
+// two deposit invoices for one deal.
 async function createDepositInvoice(opportunity, contact) {
+  return withLock(`deposit:${opportunity.id}`, () => createDepositInvoiceLocked(opportunity, contact));
+}
+
+async function createDepositInvoiceLocked(opportunity, contact) {
   const reference = `Deposit - ${opportunity.id}`;
 
   // Idempotency: this webhook could fire more than once for the same
   // stage-change (GHL workflow re-runs, a manual re-trigger, etc.) — check
   // Xero for an invoice with this Reference before creating a duplicate.
-  const already = await xeroRequest('Invoices', { params: { where: `Reference=="${reference}"` } });
+  // Excludes VOIDED/DELETED — audit 2026-08-31: without this, voiding a
+  // mistaken deposit invoice in Xero would permanently block a real one
+  // from ever being created, since the voided invoice still matches.
+  const already = await xeroRequest('Invoices', { params: { where: `Reference=="${reference}"&&Status!="VOIDED"&&Status!="DELETED"` } });
   if (already.Invoices?.length) {
-    console.log(`Deposit invoice already exists for opportunity ${opportunity.id} — skipping.`);
-    return already.Invoices[0];
+    console.log(`Deposit invoice already exists for opportunity ${opportunity.id} — checking it was actually emailed.`);
+    const invoice = already.Invoices[0];
+    // Re-sent even on the already-exists path — cheap and safe, and the
+    // alternative (previous behavior) silently never emailed at all if
+    // the first attempt failed after invoice creation.
+    await xeroRequest(`Invoices/${invoice.InvoiceID}/Email`, { method: 'POST' });
+    return invoice;
   }
 
   const dealValue = Number(opportunity.monetaryValue ?? 0);
@@ -347,19 +380,31 @@ async function createDepositInvoice(opportunity, contact) {
 // deposit invoice to already exist — refuses to invent a final-payment
 // amount for a deal that was never deposit-invoiced in the first place.
 // ---------------------------------------------------------------------------
+// Locked by opportunity ID — same reasoning as createDepositInvoice: an
+// audit found two overlapping calls (double-click on "send final invoice",
+// or a client retry) could both pass the idempotency check before either
+// finished, creating two final invoices for one deal.
 async function createFinalInvoice(opportunity, contact) {
+  return withLock(`final:${opportunity.id}`, () => createFinalInvoiceLocked(opportunity, contact));
+}
+
+async function createFinalInvoiceLocked(opportunity, contact) {
   const depositReference = `Deposit - ${opportunity.id}`;
   const finalReference = `Final Payment - ${opportunity.id}`;
 
-  const depositInvoices = await xeroRequest('Invoices', { params: { where: `Reference=="${depositReference}"` } });
+  // Excludes VOIDED/DELETED — a voided deposit invoice must not count as
+  // "the deposit exists" (audit 2026-08-31).
+  const depositInvoices = await xeroRequest('Invoices', { params: { where: `Reference=="${depositReference}"&&Status!="VOIDED"&&Status!="DELETED"` } });
   if (!depositInvoices.Invoices?.length) {
-    throw new Error(`No deposit invoice found for opportunity ${opportunity.id} — cannot create a final invoice before the deposit exists.`);
+    throw new Error(`No valid (non-voided) deposit invoice found for opportunity ${opportunity.id} — cannot create a final invoice before the deposit exists.`);
   }
 
-  const already = await xeroRequest('Invoices', { params: { where: `Reference=="${finalReference}"` } });
+  const already = await xeroRequest('Invoices', { params: { where: `Reference=="${finalReference}"&&Status!="VOIDED"&&Status!="DELETED"` } });
   if (already.Invoices?.length) {
-    console.log(`Final invoice already exists for opportunity ${opportunity.id} — skipping.`);
-    return already.Invoices[0];
+    console.log(`Final invoice already exists for opportunity ${opportunity.id} — checking it was actually emailed and stock-sheet notified.`);
+    const invoice = already.Invoices[0];
+    await notifyFinalInvoiceCreated(opportunity, invoice);
+    return invoice;
   }
 
   const dealValue = Number(opportunity.monetaryValue ?? 0);
@@ -392,6 +437,19 @@ async function createFinalInvoice(opportunity, contact) {
 
   const created = await xeroRequest('Invoices', { method: 'PUT', body: { Invoices: [invoicePayload] } });
   const invoice = created.Invoices[0];
+  await notifyFinalInvoiceCreated(opportunity, invoice);
+
+  return invoice;
+}
+
+// Shared by both the newly-created and already-existed paths in
+// createFinalInvoiceLocked — an audit found the "already exists" path
+// previously skipped email + stock-sheet notification entirely, so a
+// failure right after invoice creation (before either of these ran) left
+// the invoice permanently un-emailed and the stock sheet never told,
+// since a replay would hit "already exists" and short-circuit.
+async function notifyFinalInvoiceCreated(opportunity, invoice) {
+  // Re-sent even when the invoice already existed — cheap and safe.
   await xeroRequest(`Invoices/${invoice.InvoiceID}/Email`, { method: 'POST' });
 
   // Best-effort — tells the stock sheet agent this deal is now waiting on
@@ -405,8 +463,6 @@ async function createFinalInvoice(opportunity, contact) {
       body: JSON.stringify({ externalRef: opportunity.id, status: 'Invoiced' })
     }).catch((err) => console.error(`Opportunity ${opportunity.id}: failed to set final payment status on stock sheet:`, err.message));
   }
-
-  return invoice;
 }
 
 const DEPOSIT_FAILED_LOG_FILE = process.env.DEPOSIT_FAILED_LOG_FILE || '/data/deposit-invoice-failures.json';
@@ -663,30 +719,38 @@ app.get('/admin/needs-sku-assignment', (_req, res) => {
 
 // A human supplies the SKU/quantity this deal is actually for. Calls the
 // same two stock-sheet-agent endpoints the Shopify agent already uses.
+// Locked by opportunity ID — an audit found that without this, two
+// near-simultaneous submissions (double-click, or a client retry after a
+// slow response) could both find the entry still unresolved and both fire
+// the downstream stock/log calls, double-recording one real deal.
 app.post('/admin/assign-sku', async (req, res) => {
   const { opportunityId, sku, quantity, allocation, batchReference, expectedDate } = req.body;
   if (!opportunityId || !sku || !quantity) {
     return res.status(400).json({ error: 'opportunityId, sku, and quantity are required' });
   }
-  const queue = loadNeedsSkuQueue();
-  const entry = queue.find((e) => e.opportunityId === opportunityId && !e.resolved);
-  if (!entry) return res.status(404).json({ error: `No pending SKU assignment found for opportunity ${opportunityId}` });
-
   try {
-    await callStockSheetAgent('/admin/record-order', { sku, quantity: Number(quantity) });
-    await callStockSheetAgent('/admin/log-sold-deal', {
-      source: 'Pipely', externalRef: opportunityId, customerName: entry.contactName || entry.contactEmail || entry.dealName,
-      email: entry.contactEmail, sku, quantity: Number(quantity), dealValue: entry.dealValue,
-      depositStatus: 'Deposit invoiced', allocation, batchReference, expectedDate,
-      notes: `Pipely deal ${opportunityId}, SKU assigned manually`
+    const result = await withLock(`assign-sku:${opportunityId}`, async () => {
+      const queue = loadNeedsSkuQueue();
+      const entry = queue.find((e) => e.opportunityId === opportunityId && !e.resolved);
+      if (!entry) throw new Error(`No pending SKU assignment found for opportunity ${opportunityId}`);
+
+      await callStockSheetAgent('/admin/record-order', { sku, quantity: Number(quantity) });
+      await callStockSheetAgent('/admin/log-sold-deal', {
+        source: 'Pipely', externalRef: opportunityId, customerName: entry.contactName || entry.contactEmail || entry.dealName,
+        email: entry.contactEmail, sku, quantity: Number(quantity), dealValue: entry.dealValue,
+        depositStatus: 'Deposit invoiced', allocation, batchReference, expectedDate,
+        notes: `Pipely deal ${opportunityId}, SKU assigned manually`
+      });
+      entry.resolved = true;
+      entry.resolvedSku = sku;
+      entry.resolvedAt = new Date().toISOString();
+      saveNeedsSkuQueue(queue);
+      return { opportunityId, sku, quantity };
     });
-    entry.resolved = true;
-    entry.resolvedSku = sku;
-    entry.resolvedAt = new Date().toISOString();
-    saveNeedsSkuQueue(queue);
-    res.json({ ok: true, opportunityId, sku, quantity });
+    res.json({ ok: true, ...result });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    const status = err.message.startsWith('No pending SKU assignment') ? 404 : 500;
+    res.status(status).json({ error: err.message });
   }
 });
 
