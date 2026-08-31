@@ -64,4 +64,13 @@ XERO_TAX_TYPE=
 # Where flagged deposit-invoice failures are persisted.
 DEPOSIT_FAILED_LOG_FILE=/data/deposit-invoice-failures.json
 
+# --- Stock sheet link (added 2026-08-31) — optional. Same stock sheet
+# agent the Shopify agent talks to. Every deposit-invoiced Pipely deal gets
+# flagged for manual SKU assignment (GET /admin/needs-sku-assignment,
+# POST /admin/assign-sku) until a Pipely product field exists to resolve
+# it automatically. Leave blank to skip this entirely.
+STOCK_SHEET_AGENT_URL=
+STOCK_SHEET_AGENT_API_KEY=
+NEEDS_SKU_FILE=/data/pipely-needs-sku.json
+
 PORT=3008

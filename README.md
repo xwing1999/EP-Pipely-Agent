@@ -57,6 +57,18 @@ proposal") but has no confirmed API/webhook access — not wired up.
 On failure: flagged to a persisted log, never auto-retried. Fix the root
 cause, then call `POST /admin/replay-deposit`.
 
+## Stock sheet link (added 2026-08-31)
+
+Right after a deposit invoice is created, this agent also tells
+`everest-plunge-stock-sheet-agent` about the sale — same as the Shopify
+agent already does. The catch: Pipely has no field yet saying which
+SKU/product a deal is for, so the connection itself is real but every deal
+lands in a "needs SKU" queue for a human to finish, rather than guessing
+from the deal's free-text name. Fully automatic once your product dropdown
+exists — see `resolveSkuFromOpportunity` in `index.js`, currently a stub
+matching `everest-plunge-qwilr-agent`'s honesty about what isn't confirmed
+yet. Nothing else in this flow needs to change when that's wired in.
+
 ## Admin endpoints (require `x-api-key`)
 
 - `GET /admin/mismatches` — current flagged reconciliation deals.
@@ -64,6 +76,10 @@ cause, then call `POST /admin/replay-deposit`.
 - `GET /admin/deposit-failures` — flagged deposit-invoice failures.
 - `POST /admin/replay-deposit` — body `{ "opportunityId": "..." }`,
   reprocesses a failed deposit invoice after you've fixed the cause.
+- `GET /admin/needs-sku-assignment` — Pipely deals waiting on a human to
+  say which product they're for.
+- `POST /admin/assign-sku` — body `{ "opportunityId", "sku", "quantity" }`,
+  completes the stock sheet update for one deal.
 
 ## Not yet confirmed — verify once you have real data flowing
 

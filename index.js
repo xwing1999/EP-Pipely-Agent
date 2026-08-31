@@ -507,6 +507,115 @@ function verifyPipelyWebhookSecret(req) {
   return provided === process.env.PIPELY_WEBHOOK_SECRET;
 }
 
+// ---------------------------------------------------------------------------
+// STOCK SHEET LINK (added 2026-08-31) — the connection itself is trivial
+// (same pattern as shopify-xero-agent calling stock-sheet-agent), but
+// Pipely has no field yet saying which SKU/product a deal is for. Rather
+// than wait for that, or guess from the deal name (unreliable — free text,
+// not a real field), this flags every deposit-invoiced deal for a human to
+// assign a SKU to, same "capture what we have, let a human close the last
+// gap" pattern used for the Qwilr agent. Once Xavier's Pipely product
+// dropdown exists, this becomes fully automatic — resolveSku (a stub
+// below, mirroring qwilr-agent's tryResolveOpportunityId) is where that
+// gets wired in, without changing anything else in this flow.
+// ---------------------------------------------------------------------------
+const NEEDS_SKU_FILE = process.env.NEEDS_SKU_FILE || '/data/pipely-needs-sku.json';
+
+function loadNeedsSkuQueue() {
+  try { return JSON.parse(fs.readFileSync(NEEDS_SKU_FILE, 'utf8')); } catch { return []; }
+}
+function saveNeedsSkuQueue(arr) {
+  try {
+    fs.mkdirSync(path.dirname(NEEDS_SKU_FILE), { recursive: true });
+    fs.writeFileSync(NEEDS_SKU_FILE, JSON.stringify(arr, null, 2));
+  } catch (err) {
+    console.warn('Could not persist needs-SKU queue to disk:', err.message);
+  }
+}
+
+// Stub, same honesty as qwilr-agent's tryResolveOpportunityId — returns
+// null until Xavier's Pipely product dropdown exists and its field key is
+// known. Update this once it does; nothing else here needs to change.
+function resolveSkuFromOpportunity(_opportunity) {
+  return null;
+}
+
+async function callStockSheetAgent(pathSegment, body) {
+  const res = await fetch(`${process.env.STOCK_SHEET_AGENT_URL}${pathSegment}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.STOCK_SHEET_AGENT_API_KEY },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) throw new Error(`Stock sheet agent error ${res.status} on ${pathSegment}: ${await res.text()}`);
+}
+
+// Called once per opportunity right after its deposit invoice is created
+// (or found already existing) — idempotent per opportunityId via the
+// queue itself, so a replayed trigger doesn't add a duplicate entry.
+async function flagOrLinkStockForOpportunity(opportunity, contact) {
+  if (!process.env.STOCK_SHEET_AGENT_URL) return;
+
+  const queue = loadNeedsSkuQueue();
+  if (queue.some((e) => e.opportunityId === opportunity.id)) return; // already flagged or already resolved
+
+  // Same name-derivation as findOrCreateXeroContactForPipely above, for consistency.
+  const contactName = [contact?.firstName, contact?.lastName].filter(Boolean).join(' ') || contact?.name || contact?.email || '';
+
+  const sku = resolveSkuFromOpportunity(opportunity);
+  if (sku) {
+    // Unreachable until resolveSkuFromOpportunity is implemented for real.
+    await callStockSheetAgent('/admin/record-order', { sku, quantity: 1 });
+    await callStockSheetAgent('/admin/log-sold-deal', {
+      source: 'Pipely', customerName: contactName || opportunity.name,
+      email: contact?.email || '', sku, quantity: 1, dealValue: opportunity.monetaryValue,
+      depositStatus: 'Deposit invoiced', notes: `Pipely deal ${opportunity.id}, auto-resolved`
+    });
+    return;
+  }
+
+  queue.push({
+    opportunityId: opportunity.id,
+    dealName: opportunity.name,
+    dealValue: opportunity.monetaryValue,
+    contactName,
+    contactEmail: contact?.email || '',
+    at: new Date().toISOString()
+  });
+  saveNeedsSkuQueue(queue);
+}
+
+app.get('/admin/needs-sku-assignment', (_req, res) => {
+  res.json({ pending: loadNeedsSkuQueue().filter((e) => !e.resolved) });
+});
+
+// A human supplies the SKU/quantity this deal is actually for. Calls the
+// same two stock-sheet-agent endpoints the Shopify agent already uses.
+app.post('/admin/assign-sku', async (req, res) => {
+  const { opportunityId, sku, quantity } = req.body;
+  if (!opportunityId || !sku || !quantity) {
+    return res.status(400).json({ error: 'opportunityId, sku, and quantity are required' });
+  }
+  const queue = loadNeedsSkuQueue();
+  const entry = queue.find((e) => e.opportunityId === opportunityId && !e.resolved);
+  if (!entry) return res.status(404).json({ error: `No pending SKU assignment found for opportunity ${opportunityId}` });
+
+  try {
+    await callStockSheetAgent('/admin/record-order', { sku, quantity: Number(quantity) });
+    await callStockSheetAgent('/admin/log-sold-deal', {
+      source: 'Pipely', customerName: entry.contactName || entry.contactEmail || entry.dealName,
+      email: entry.contactEmail, sku, quantity: Number(quantity), dealValue: entry.dealValue,
+      depositStatus: 'Deposit invoiced', notes: `Pipely deal ${opportunityId}, SKU assigned manually`
+    });
+    entry.resolved = true;
+    entry.resolvedSku = sku;
+    entry.resolvedAt = new Date().toISOString();
+    saveNeedsSkuQueue(queue);
+    res.json({ ok: true, opportunityId, sku, quantity });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/webhooks/pipely/deposit-trigger', async (req, res) => {
   if (!verifyPipelyWebhookSecret(req)) {
     console.warn('Rejected deposit-trigger webhook with invalid/missing secret.');
@@ -529,6 +638,11 @@ app.post('/webhooks/pipely/deposit-trigger', async (req, res) => {
     const contact = await fetchPipelyContact(opportunity.contactId);
     const invoice = await createDepositInvoice(opportunity, contact);
     console.log(`Opportunity ${opportunityId}: deposit invoice ${invoice.InvoiceNumber} (${invoice.InvoiceID}) ready.`);
+    // Best-effort, does not throw — the invoice above is what actually
+    // matters and has already succeeded. See "STOCK SHEET LINK" above.
+    await flagOrLinkStockForOpportunity(opportunity, contact).catch((err) =>
+      console.error(`Opportunity ${opportunityId}: stock sheet link failed:`, err.message)
+    );
   } catch (err) {
     console.error(`Opportunity ${opportunityId} deposit invoice FAILED — flagging, not retrying automatically:`, err.message);
     appendDepositFailedLog({ opportunityId, error: err.message });
@@ -553,6 +667,9 @@ app.post('/admin/replay-deposit', async (req, res) => {
     const opportunity = await fetchPipelyOpportunity(opportunityId);
     const contact = await fetchPipelyContact(opportunity.contactId);
     const invoice = await createDepositInvoice(opportunity, contact);
+    await flagOrLinkStockForOpportunity(opportunity, contact).catch((err) =>
+      console.error(`Opportunity ${opportunityId}: stock sheet link failed:`, err.message)
+    );
     entry.resolved = true;
     entry.resolvedAt = new Date().toISOString();
     try {
