@@ -867,10 +867,10 @@ app.get('/admin/deposit-to-won', async (_req, res) => {
 // a Xero reference). Don't guess that matching key — confirm with Xavier
 // once Xero is connected and a real synced pair can be inspected.
 //
-// What IS confirmed real: every Pipely invoice carries `opportunityId`,
-// an exact match against the opportunity's own `id` — no fuzzy matching
-// needed for this half, unlike the email-based reconciliation elsewhere
-// in this file.
+// What IS confirmed real: every Pipely invoice carries
+// `opportunityDetails.opportunityId`, an exact match against the
+// opportunity's own `id` — no fuzzy matching needed for this half, unlike
+// the email-based reconciliation elsewhere in this file.
 // ---------------------------------------------------------------------------
 app.get('/admin/invoice-check', async (_req, res) => {
   try {
@@ -894,7 +894,11 @@ app.get('/admin/invoice-check', async (_req, res) => {
 
     const invoiceByOpportunityId = new Map();
     for (const inv of invoices) {
-      if (inv.opportunityId) invoiceByOpportunityId.set(inv.opportunityId, inv);
+      // Confirmed live 2026-09-01: opportunityId is nested under
+      // opportunityDetails, not a top-level field — a naive top-level
+      // read silently matched zero invoices despite the data being there.
+      const oppId = inv.opportunityDetails?.opportunityId;
+      if (oppId) invoiceByOpportunityId.set(oppId, inv);
     }
 
     const checked = [];
