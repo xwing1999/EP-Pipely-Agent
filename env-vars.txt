@@ -5,20 +5,20 @@
 # Shared secret for /admin endpoints.
 API_KEY=
 
-# Xero OAuth app for Everest Plunge's OWN Xero organisation. Can reuse the
-# SAME Xero app (Client ID/Secret) as everest-plunge-shopify-xero-agent if
-# you'd rather manage one Xero app for the whole business — just make sure
-# the redirect URI below matches THIS service's URL, since Xero apps can
-# have multiple redirect URIs registered. Do not reuse a Kiwiseal Xero app.
+# Xero — Custom Connection app "EP-Agent", for Everest Plunge's OWN Xero
+# organisation. Do not reuse a Kiwiseal Xero app. This is a Custom
+# Connection (client_credentials grant), not the redirect-based OAuth the
+# older Kiwiseal Xero agents use — no redirect URI, no refresh token, no
+# browser flow needed. Just paste the Client ID/Secret once the Connection
+# invite has been approved inside Xero's own UI (see README's setup
+# checklist).
 XERO_CLIENT_ID=
 XERO_CLIENT_SECRET=
-XERO_REDIRECT_URI=
 
-# Leave blank on first deploy — filled in via the /oauth/start flow, same as
-# every other Xero agent in this project.
+# Leave blank — auto-discovered on first Xero API call and cached in
+# memory. Only set this if you need to override auto-discovery for some
+# reason.
 XERO_TENANT_ID=
-XERO_REFRESH_TOKEN=
-XERO_TOKEN_FILE=/data/xero-token.json
 
 # Pipely (GoHighLevel) — Everest Plunge's OWN location, not Kiwiseal's.
 # Find the location ID in Pipely's Settings > Business Info, and generate

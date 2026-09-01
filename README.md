@@ -188,9 +188,16 @@ yet. Nothing else in this flow needs to change when that's wired in.
 
 ## Setup checklist
 
-1. Xero Developer app pointed at Everest Plunge's org (can reuse the same
-   app as the Shopify agent — add this service's `/oauth/callback` as an
-   additional redirect URI). Deploy, visit `/oauth/start` once.
+1. Xero: this agent uses a **Custom Connection** app ("EP-Agent", created
+   2026-09-01), not the redirect-based OAuth flow the older Kiwiseal Xero
+   agents use — there's no `/oauth/start` here, nothing to visit in a
+   browser for this agent specifically. In Xero's developer portal, invite
+   yourself (or whoever should approve it) by email on the app's
+   Connection page, then approve that invite once, logged into **Everest
+   Plunge's** Xero org (not Kiwiseal's). Once "Connected organisation"
+   shows connected, paste `XERO_CLIENT_ID`/`XERO_CLIENT_SECRET` into
+   Railway — no redirect URI, no refresh token, nothing else Xero-side to
+   configure.
 2. Pipely: Everest Plunge's own location ID + API key.
 3. Fill in `XERO_SALES_ACCOUNT_CODE`/`XERO_TAX_TYPE` (same real values as
    the Shopify agent) and `PIPELY_WEBHOOK_SECRET`.

@@ -25,13 +25,12 @@ function withLock(key, fn) {
 
 // ---------------------------------------------------------------------------
 // AUTH — shared-secret pattern, same as every other agent in this project.
-// /oauth/* stays exempt (one-time browser flow, no header a redirect can
-// carry), and /webhooks/* stays exempt too — GoHighLevel's workflow
-// webhook action has its own separate secret check (verifyPipelyWebhookSecret,
-// further down) rather than sending an x-api-key header.
+// /webhooks/* stays exempt — GoHighLevel's workflow webhook action has its
+// own separate secret check (verifyPipelyWebhookSecret, further down)
+// rather than sending an x-api-key header.
 // ---------------------------------------------------------------------------
 app.use((req, res, next) => {
-  if (req.path === '/health' || req.path.startsWith('/oauth/') || req.path.startsWith('/webhooks/')) return next();
+  if (req.path === '/health' || req.path.startsWith('/webhooks/')) return next();
   const provided = req.header('x-api-key');
   if (!process.env.API_KEY || provided !== process.env.API_KEY) {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -40,76 +39,53 @@ app.use((req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
-// XERO OAUTH TOKEN MANAGEMENT — same pattern as wellington-xero-agent. Both
-// read (reconciliation) and write (deposit invoicing, added 2026-08-24 —
-// see "DEPOSIT INVOICING" below) scopes are requested.
+// XERO TOKEN MANAGEMENT — Custom Connection (client_credentials grant), NOT
+// the authorization-code + redirect + refresh-token flow the original
+// Kiwiseal Xero agents use. Xavier's Xero app for this agent ("EP-Agent")
+// is a Custom Connection: locked to one specific Xero org, one invited user
+// approves it once inside Xero's own UI (no /oauth/start redirect needed
+// or possible), and there is no refresh token at all — a fresh access
+// token is requested directly via client_id + client_secret whenever the
+// cached one is expired or missing. Confirmed 2026-09-01 from the app's
+// Xero configuration screen (invited-email + "connected organisation"
+// status is specific to Custom Connections). If this agent's Xero app is
+// ever recreated as a standard Web app instead, this whole block needs to
+// go back to an authorization-code flow — don't assume this stays valid.
 // ---------------------------------------------------------------------------
-const TOKEN_FILE = process.env.XERO_TOKEN_FILE || '/data/xero-token.json';
-
 const tokenState = {
   accessToken: null,
-  refreshToken: process.env.XERO_REFRESH_TOKEN || null,
   tenantId: process.env.XERO_TENANT_ID || null,
   expiresAt: 0
 };
 
-function loadPersistedToken() {
-  try {
-    const saved = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8'));
-    if (saved.refreshToken) tokenState.refreshToken = saved.refreshToken;
-    if (saved.tenantId) tokenState.tenantId = saved.tenantId;
-    console.log('Loaded persisted Xero token from disk.');
-  } catch {
-    // No persisted file yet, or no volume mounted — fall back to env vars.
-  }
-}
-loadPersistedToken();
-
-function persistToken() {
-  try {
-    fs.mkdirSync(path.dirname(TOKEN_FILE), { recursive: true });
-    fs.writeFileSync(TOKEN_FILE, JSON.stringify({
-      refreshToken: tokenState.refreshToken,
-      tenantId: tokenState.tenantId
-    }));
-  } catch (err) {
-    console.warn(
-      'Could not persist Xero token to disk (no volume mounted at ' + TOKEN_FILE + '?). ' +
-      'Relying on in-memory cache + env var fallback. Error:', err.message
-    );
-  }
-}
-
 async function refreshAccessToken() {
-  if (!tokenState.refreshToken) {
-    throw new Error('No Xero refresh token available yet — visit /oauth/start in a browser to authorize this agent.');
-  }
   const res = await fetch('https://identity.xero.com/connect/token', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
       Authorization: 'Basic ' + Buffer.from(`${process.env.XERO_CLIENT_ID}:${process.env.XERO_CLIENT_SECRET}`).toString('base64')
     },
-    body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: tokenState.refreshToken })
+    body: new URLSearchParams({ grant_type: 'client_credentials' })
   });
   if (!res.ok) {
-    throw new Error(`Xero token refresh failed ${res.status}: ${await res.text()}`);
+    throw new Error(`Xero client_credentials token request failed ${res.status}: ${await res.text()}`);
   }
   const data = await res.json();
   tokenState.accessToken = data.access_token;
-  tokenState.refreshToken = data.refresh_token;
   tokenState.expiresAt = Date.now() + (data.expires_in - 60) * 1000;
-  console.log('Xero access token refreshed. New refresh_token (fallback only — prefer the persisted file):', tokenState.refreshToken);
-  persistToken();
 
+  // Custom Connections are locked to exactly one org, but the API still
+  // requires the Xero-tenant-id header on every call — fetch it once and
+  // cache in memory; cheap enough to re-fetch on every container restart,
+  // no need to persist it to disk.
   if (!tokenState.tenantId) {
     const connRes = await fetch('https://api.xero.com/connections', {
       headers: { Authorization: `Bearer ${tokenState.accessToken}` }
     });
     const conns = await connRes.json();
-    if (!conns.length) throw new Error('No Xero tenant connections found for this token.');
+    if (!conns.length) throw new Error('No Xero tenant connections found for this token — has the Custom Connection invite actually been approved in Xero yet?');
     tokenState.tenantId = conns[0].tenantId;
-    persistToken();
+    console.log(`Xero connected to organisation: ${conns[0].tenantName ?? 'unknown'} (tenant ${tokenState.tenantId}). Confirm this says Everest Plunge, not Kiwiseal.`);
   }
 }
 
@@ -143,68 +119,6 @@ async function xeroRequest(pathSegment, { method = 'GET', params, body, headers 
   const text = await res.text();
   return text ? JSON.parse(text) : {};
 }
-
-// WRITE scopes — this agent now also creates/sends deposit invoices (see
-// "DEPOSIT INVOICING" below, added 2026-08-24 once Xavier confirmed he
-// wants this automated), not just reading for reconciliation.
-app.get('/oauth/start', (_req, res) => {
-  const params = new URLSearchParams({
-    response_type: 'code',
-    client_id: process.env.XERO_CLIENT_ID,
-    redirect_uri: process.env.XERO_REDIRECT_URI,
-    scope: 'accounting.transactions accounting.contacts offline_access',
-    state: 'setup'
-  });
-  res.redirect(`https://login.xero.com/identity/connect/authorize?${params}`);
-});
-
-app.get('/oauth/callback', async (req, res) => {
-  const { code, error } = req.query;
-  if (error) return res.status(400).send(`Xero returned an error: ${error}`);
-  if (!code) return res.status(400).send('Missing code parameter.');
-
-  try {
-    const tokenRes = await fetch('https://identity.xero.com/connect/token', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        Authorization: 'Basic ' + Buffer.from(`${process.env.XERO_CLIENT_ID}:${process.env.XERO_CLIENT_SECRET}`).toString('base64')
-      },
-      body: new URLSearchParams({
-        grant_type: 'authorization_code',
-        code,
-        redirect_uri: process.env.XERO_REDIRECT_URI
-      })
-    });
-    if (!tokenRes.ok) throw new Error(await tokenRes.text());
-    const data = await tokenRes.json();
-
-    tokenState.accessToken = data.access_token;
-    tokenState.refreshToken = data.refresh_token;
-    tokenState.expiresAt = Date.now() + (data.expires_in - 60) * 1000;
-
-    const connRes = await fetch('https://api.xero.com/connections', {
-      headers: { Authorization: `Bearer ${tokenState.accessToken}` }
-    });
-    const conns = await connRes.json();
-    tokenState.tenantId = conns[0]?.tenantId ?? null;
-    persistToken();
-
-    res.send(`
-      <h2>Xero connected</h2>
-      <p>Organisation: ${conns[0]?.tenantName ?? 'unknown'}</p>
-      <p>Tenant ID: ${tokenState.tenantId ?? 'not found'}</p>
-      <p>Confirm this says Everest Plunge, not Kiwiseal. This is saved. If this
-      Railway service has no persistent volume attached, also copy this refresh
-      token into the <code>XERO_REFRESH_TOKEN</code> Railway variable as a
-      backup so a future restart doesn't strand this agent:</p>
-      <pre>${tokenState.refreshToken}</pre>
-      <p>You can close this tab.</p>
-    `);
-  } catch (err) {
-    res.status(500).send(`Token exchange failed: ${err.message}`);
-  }
-});
 
 // ---------------------------------------------------------------------------
 // PIPELY (GoHighLevel/LeadConnector) — same proven REST pattern as
@@ -858,11 +772,11 @@ app.get('/admin/deposit-to-won', async (_req, res) => {
 // check he described; the second half — cross-checking each invoice's
 // payment status against Xero, since "Xero is our true accounting
 // software... an invoice reconciled as paid in Xero needs to be showing
-// paid in Pipely" — is NOT built yet. It's blocked on this agent's Xero
-// OAuth actually being connected (XERO_CLIENT_ID/SECRET/REFRESH_TOKEN are
-// still unset — see the setup checklist further down this file), and on
-// confirming HOW a Pipely invoice and its Xero counterpart are meant to
-// line up (no confirmed shared key seen yet — these 124 real invoices
+// paid in Pipely" — is NOT built yet as of this endpoint. Xero's Custom
+// Connection was set up the same day (see the XERO TOKEN MANAGEMENT
+// comment near the top of this file), but confirming HOW a Pipely invoice
+// and its Xero counterpart are meant to line up still needs a real synced
+// pair to inspect (no confirmed shared key seen yet — these 124 real invoices
 // carry Pipely's own `estimateId`/`invoiceNumber`, nothing recognizable as
 // a Xero reference). Don't guess that matching key — confirm with Xavier
 // once Xero is connected and a real synced pair can be inspected.
