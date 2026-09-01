@@ -147,12 +147,20 @@ async function xeroRequest(pathSegment, { method = 'GET', params, body, headers 
 // WRITE scopes — this agent now also creates/sends deposit invoices (see
 // "DEPOSIT INVOICING" below, added 2026-08-24 once Xavier confirmed he
 // wants this automated), not just reading for reconciliation.
+//
+// accounting.transactions failed live 2026-09-01 with invalid_scope — this
+// app was created against a newer Xero API version that's split it into
+// granular scopes (accounting.invoices, accounting.contacts, etc., same
+// split seen on the Custom Connection screen earlier). accounting.invoices
+// covers creating/reading/emailing invoices (this agent never creates
+// Payment records directly, so no separate accounting.payments scope is
+// needed for what's built today — add it if that changes).
 app.get('/oauth/start', (_req, res) => {
   const params = new URLSearchParams({
     response_type: 'code',
     client_id: process.env.XERO_CLIENT_ID,
     redirect_uri: process.env.XERO_REDIRECT_URI,
-    scope: 'accounting.transactions accounting.contacts offline_access',
+    scope: 'accounting.invoices accounting.contacts offline_access',
     state: 'setup'
   });
   res.redirect(`https://login.xero.com/identity/connect/authorize?${params}`);
