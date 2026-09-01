@@ -534,6 +534,115 @@ async function notifyFinalInvoiceCreated(opportunity, invoice) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// FINAL INVOICE SWEEP (added 2026-09-01) — Xavier's replacement for the
+// earlier "ship date lives in a spreadsheet, unconfirmed" blocker and for
+// Pipely's own "5 - Ops Pipeline" (explicitly being retired, not used for
+// this): "I want rather a countdown on orders arriving to shores from
+// their container boats and the invoices will go out on that." Confirmed
+// same day: the ETA is set per BATCH/shipment, not per order (matches how
+// the real spreadsheet already tracks it — one ETA per batch tab, shared
+// by every client on that shipment), entered manually by ops (Mainfreight's
+// real API isn't confirmed), and the final invoice should go out
+// AUTOMATICALLY once an order's batch is within FINAL_INVOICE_LEAD_DAYS of
+// its ETA — no human approval step, per Xavier's explicit choice over the
+// flagged-for-review alternative.
+//
+// Runs on the same periodic-timer pattern as reconciliation. Reads
+// stock-sheet-agent's Automation Log via its existing GET
+// /admin/automation-log, which now resolves a computed "Ship ETA" field
+// per entry (from stock-sheet-agent's own batch-ETA store, joined by
+// "Batch Reference" — see that agent's BATCH ETA / COUNTDOWN comment).
+// Computes days-until-arrival from that, and calls the SAME
+// createFinalInvoice used by the human-triggered POST
+// /admin/create-final-invoice endpoint — so it inherits that function's
+// existing idempotency (checks Xero for an existing "Final Payment -
+// {opportunityId}" invoice before creating another) for free. That's what
+// makes it safe to run this sweep repeatedly on a schedule without
+// double-invoicing an order that's already been handled.
+//
+// Only acts on entries with an External Ref (linked Pipely opportunity) —
+// an order logged without one (e.g. before this field existed, or entered
+// by hand with a typo) is skipped and logged, not guessed at.
+// ---------------------------------------------------------------------------
+const FINAL_INVOICE_LEAD_DAYS = Number(process.env.FINAL_INVOICE_LEAD_DAYS ?? 7);
+const FINAL_SWEEP_INTERVAL_MINUTES = Number(process.env.FINAL_SWEEP_INTERVAL_MINUTES ?? 60);
+const FINAL_SWEEP_LOG_FILE = process.env.FINAL_SWEEP_LOG_FILE || '/data/final-invoice-sweep-log.json';
+
+async function fetchAutomationLogEntries() {
+  if (!process.env.STOCK_SHEET_AGENT_URL) throw new Error('STOCK_SHEET_AGENT_URL not configured');
+  const res = await fetch(`${process.env.STOCK_SHEET_AGENT_URL}/admin/automation-log`, {
+    headers: { 'x-api-key': process.env.STOCK_SHEET_AGENT_API_KEY }
+  });
+  if (!res.ok) throw new Error(`Stock sheet agent error ${res.status} on /admin/automation-log: ${await res.text()}`);
+  const data = await res.json();
+  return data.entries ?? [];
+}
+
+function daysUntil(dateStr) {
+  const target = new Date(dateStr);
+  if (isNaN(target.getTime())) return null;
+  const msPerDay = 24 * 60 * 60 * 1000;
+  // Compare by calendar day, not exact ms, so "today" reads as 0 rather
+  // than a small negative/positive fraction depending on time-of-day.
+  const todayUTC = Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate());
+  const targetUTC = Date.UTC(target.getUTCFullYear(), target.getUTCMonth(), target.getUTCDate());
+  return Math.round((targetUTC - todayUTC) / msPerDay);
+}
+
+function loadFinalSweepLog() {
+  try { return JSON.parse(fs.readFileSync(FINAL_SWEEP_LOG_FILE, 'utf8')); } catch { return []; }
+}
+function appendFinalSweepLog(entry) {
+  const log = loadFinalSweepLog();
+  log.push({ ...entry, at: new Date().toISOString() });
+  try {
+    fs.mkdirSync(path.dirname(FINAL_SWEEP_LOG_FILE), { recursive: true });
+    fs.writeFileSync(FINAL_SWEEP_LOG_FILE, JSON.stringify(log, null, 2));
+  } catch (err) {
+    console.warn('Could not persist final-invoice sweep log to disk:', err.message);
+  }
+}
+
+async function runFinalInvoiceSweep() {
+  const entries = await fetchAutomationLogEntries();
+  const due = entries.filter((e) => {
+    if (!e['Ship ETA'] || !e['External Ref']) return false;
+    if (e['Final Payment Status'] === 'Paid' || e['Final Payment Status'] === 'Invoiced') return false;
+    if (e['Deposit Status'] === 'Paid in full') return false; // Shopify-style full-payment orders — no final invoice to send
+    const days = daysUntil(e['Ship ETA']);
+    return days !== null && days <= FINAL_INVOICE_LEAD_DAYS;
+  });
+
+  const results = [];
+  for (const entry of due) {
+    const opportunityId = entry['External Ref'];
+    try {
+      const opportunity = await fetchPipelyOpportunity(opportunityId);
+      const contact = await fetchPipelyContact(opportunity.contactId);
+      const invoice = await createFinalInvoice(opportunity, contact);
+      results.push({ orderId: entry['Order ID'], opportunityId, ok: true, invoiceNumber: invoice.InvoiceNumber });
+      console.log(`Final invoice sweep: order ${entry['Order ID']} (opportunity ${opportunityId}) -> invoice ${invoice.InvoiceNumber}.`);
+    } catch (err) {
+      results.push({ orderId: entry['Order ID'], opportunityId, ok: false, error: err.message });
+      appendFinalSweepLog({ orderId: entry['Order ID'], opportunityId, error: err.message });
+      console.error(`Final invoice sweep FAILED for order ${entry['Order ID']} (opportunity ${opportunityId}):`, err.message);
+    }
+  }
+
+  console.log(`Final invoice sweep: ${entries.length} orders checked, ${due.length} within ${FINAL_INVOICE_LEAD_DAYS}-day window, ${results.filter((r) => r.ok).length} invoiced OK.`);
+  return results;
+}
+
+let finalSweepTimer = null;
+function scheduleFinalInvoiceSweep() {
+  runFinalInvoiceSweep().catch((err) => console.error('Initial final-invoice sweep failed:', err.message));
+  finalSweepTimer = setInterval(() => {
+    runFinalInvoiceSweep().catch((err) => console.error('Scheduled final-invoice sweep failed:', err.message));
+  }, FINAL_SWEEP_INTERVAL_MINUTES * 60 * 1000);
+}
+scheduleFinalInvoiceSweep();
+
 const DEPOSIT_FAILED_LOG_FILE = process.env.DEPOSIT_FAILED_LOG_FILE || '/data/deposit-invoice-failures.json';
 
 function loadDepositFailedLog() {
@@ -1185,6 +1294,19 @@ app.post('/webhooks/pipely/deposit-trigger', async (req, res) => {
 
 app.get('/admin/deposit-failures', (_req, res) => {
   res.json({ failures: loadDepositFailedLog() });
+});
+
+app.get('/admin/final-invoice-sweep-log', (_req, res) => {
+  res.json({ failures: loadFinalSweepLog() });
+});
+
+app.post('/admin/run-final-invoice-sweep', async (_req, res) => {
+  try {
+    const results = await runFinalInvoiceSweep();
+    res.json({ ok: true, checked: results.length, results });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Reprocess a flagged deposit-invoice failure after the underlying problem

@@ -22,10 +22,14 @@ Five jobs — the first two are Pipely-only, the rest are between Pipely and Xer
 2. **Deposit invoicing** (write) — creates and emails a booking-deposit
    Xero invoice automatically when a deal reaches the "send deposit" stage
    in Pipely. Added 2026-08-24.
-3. **Final payment invoicing** (write, human-triggered) — creates and
-   emails the remaining 50% once someone decides an order is ready to
-   release. Added 2026-08-31 alongside the stock sheet agent's release
-   gate — see below.
+3. **Final payment invoicing** (write, human-triggered OR automatic) —
+   creates and emails the remaining 50% once an order is ready to release.
+   Added 2026-08-31 alongside the stock sheet agent's release gate — see
+   below. As of 2026-09-01, also fires automatically via the final invoice
+   sweep — see below.
+4. **Final invoice sweep** (write, fully automatic, added 2026-09-01) —
+   periodically checks every order's batch ETA and fires the final invoice
+   once it's within the lead-time window. See below.
 
 ## Deposit-to-won tracking
 
@@ -132,17 +136,46 @@ amount as the same `DEPOSIT_PERCENTAGE` split off the deal value, not
 "deal value minus whatever the deposit invoice says now" — so it can't
 drift if the deposit invoice was edited after the fact.
 
-**Deliberately not on any automatic schedule.** Nothing here knows a real
-ship date yet — that lives in the still-unconfirmed batch tabs — so
-there's no reliable "the week before shipping" trigger to hang this off
-of. A human calls this (via the ops console) once they've decided an order
-is ready. After creating the invoice, this also tells
-`everest-plunge-stock-sheet-agent` the deal's final payment status is now
-"Invoiced" (via its `External Ref`, best-effort, doesn't block on failure)
-— that agent then refuses to let the order be marked sent until someone
-confirms the payment actually cleared and calls
-`POST /admin/mark-final-payment-received` there. That's the real release
-gate; this agent only creates the invoice.
+Can be called two ways: a human, via the ops console's "Send final
+invoice" button, or automatically by the final invoice sweep below. After
+creating the invoice, this also tells `everest-plunge-stock-sheet-agent`
+the deal's final payment status is now "Invoiced" (via its `External
+Ref`, best-effort, doesn't block on failure) — that agent then refuses to
+let the order be marked sent until someone confirms the payment actually
+cleared and calls `POST /admin/mark-final-payment-received` there. That's
+the real release gate; this agent only creates the invoice.
+
+## Final invoice sweep (added 2026-09-01)
+
+Replaces the earlier "nothing here knows a real ship date" blocker.
+Xavier: "I want a countdown on orders arriving to shores from their
+container boats and the invoices will go out on that" — confirmed
+**fully automatic**, no human approval step.
+
+Every `FINAL_SWEEP_INTERVAL_MINUTES` (default 60), and once immediately
+on startup: fetches `everest-plunge-stock-sheet-agent`'s Automation Log
+(`GET /admin/automation-log`, which resolves a computed `Ship ETA` per
+entry from that agent's own per-batch ETA store — see its README). Any
+entry with an External Ref (linked Pipely opportunity), not already
+final-invoiced, whose batch is within `FINAL_INVOICE_LEAD_DAYS` (default
+7) of its ETA gets `createFinalInvoice` called on it — the same function
+the human-triggered endpoint above uses, so it inherits that function's
+existing idempotency for free (checks Xero for an existing "Final Payment
+- {opportunityId}" invoice first) — safe to run repeatedly without
+double-invoicing.
+
+**ETA is per batch/shipment, not per order** — matches the real
+spreadsheet, where one ETA is shared by every client on a shipment. Ops
+sets it once via the ops console's "Batch ETA" section.
+
+- `GET /admin/final-invoice-sweep-log` — failures from past sweeps.
+- `POST /admin/run-final-invoice-sweep` — trigger a sweep immediately,
+  same logic as the scheduled run.
+
+**Overdue orders still fire** — an ETA that's already passed (negative
+days-until-arrival) still qualifies, it doesn't get skipped for being
+late; the sweep doesn't distinguish "about to arrive" from "should have
+arrived already," both are inside the lead-time window.
 
 ## Reconciliation
 
