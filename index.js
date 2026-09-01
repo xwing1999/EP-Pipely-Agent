@@ -693,6 +693,103 @@ app.get('/admin/pipelines', async (_req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// DEPOSIT-TO-WON TRACKING (added 2026-09-01) — narrowed scope per Xavier,
+// across three messages the same day:
+// 1. "the main purpose of the AI and checking system is mainly monitor the
+//    transition from deposit sent to won deal and then so on... keep the
+//    scope fairly narrow for now."
+// 2. "we need to only monitor the end of Joel's pipeline only, he is the
+//    only current sales rep."
+// 3. "there will be a deposit sent column and the a won month and won all
+//    time column, these are the 3 that we will be watching over solely."
+// Exactly three numbers, nothing else: depositSent (current snapshot),
+// wonThisMonth, wonAllTime.
+//
+// Confirmed against the real Pipely account (2026-09-01): "2 - Joel -
+// Pipeline" has a 5-stage WON sequence, the first being
+// "3.1 - WON - Deposit Invoice Sent" — the depositSent bucket below.
+// Hardcoded to Joel's real pipeline ID (confirmed live, not guessed) per
+// Xavier's explicit narrowing — revisit if a second rep goes active.
+//
+// depositSent is matched by STAGE, not opportunity status — Xavier also
+// said the same day "we need to only flick a job to the Won status once a
+// deposit is paid," implying status currently may (or, going forward,
+// should) not flip to 'won' at the Deposit Invoice Sent stage. Trusting
+// status for this bucket would risk missing deals if that's ever
+// inconsistent; the stage itself is unambiguous.
+//
+// wonThisMonth/wonAllTime use Pipely's own status='won' — matches
+// Xavier's rule as long as the underlying GHL Workflow is actually
+// configured to flip status at Deposit Paid, not before (that's a Pipely
+// Workflow setting, outside this codebase — confirm it's set that way).
+// "This month" is approximated by lastStageChangeAt falling in the current
+// calendar month, since Pipely's opportunity object doesn't expose a
+// dedicated "became won" timestamp — this is a real approximation: a deal
+// that became won two months ago and then moved stage again this month
+// (e.g. progressed to "Product To Send") would double up as "this month"
+// too. Flagged here rather than silently treated as exact; revisit if it
+// produces a visibly wrong count once real data is watched over time.
+// ---------------------------------------------------------------------------
+const JOEL_PIPELINE_ID = 'IHzw1og6HSaa5TxKbLTX'; // "2 - Joel - Pipeline", confirmed live 2026-09-01
+const WON_STAGE_LABEL_RE = /WON\s*-\s*(.+)$/i;
+
+function normalizeWonStageLabel(stageName) {
+  const match = stageName.match(WON_STAGE_LABEL_RE);
+  return match ? match[1].trim() : null;
+}
+
+function isThisCalendarMonth(dateStr) {
+  if (!dateStr) return false;
+  const d = new Date(dateStr);
+  const now = new Date();
+  return d.getUTCFullYear() === now.getUTCFullYear() && d.getUTCMonth() === now.getUTCMonth();
+}
+
+function summarizeTrackedDeal(o) {
+  return {
+    id: o.id,
+    name: o.name,
+    value: o.monetaryValue,
+    status: o.status,
+    contactName: o.contact?.name || [o.contact?.firstName, o.contact?.lastName].filter(Boolean).join(' ') || null,
+    contactEmail: o.contact?.email || null,
+    contactPhone: o.contact?.phone || null,
+    lastStageChangeAt: o.lastStageChangeAt
+  };
+}
+
+app.get('/admin/deposit-to-won', async (_req, res) => {
+  try {
+    const [allOpportunities, wonOpportunities, pipelines] = await Promise.all([
+      fetchPipelyOpportunities(), // no status filter — for depositSent, matched by stage not status
+      fetchPipelyOpportunities('won'), // Pipely's own won status — for the two won columns
+      fetchPipelyPipelines()
+    ]);
+
+    const joelPipeline = pipelines.find((p) => p.id === JOEL_PIPELINE_ID);
+    const depositSentStageId = (joelPipeline?.stages ?? [])
+      .find((s) => normalizeWonStageLabel(s.name) === 'Deposit Invoice Sent')?.id;
+
+    const depositSentDeals = allOpportunities
+      .filter((o) => o.pipelineId === JOEL_PIPELINE_ID && o.pipelineStageId === depositSentStageId)
+      .map(summarizeTrackedDeal);
+
+    const wonAllTimeDeals = wonOpportunities.map(summarizeTrackedDeal);
+    const wonThisMonthDeals = wonOpportunities
+      .filter((o) => isThisCalendarMonth(o.lastStageChangeAt ?? o.createdAt))
+      .map(summarizeTrackedDeal);
+
+    res.json({
+      depositSent: { count: depositSentDeals.length, deals: depositSentDeals },
+      wonThisMonth: { count: wonThisMonthDeals.length, deals: wonThisMonthDeals },
+      wonAllTime: { count: wonAllTimeDeals.length, deals: wonAllTimeDeals }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // DEPOSIT INVOICE WEBHOOK — intended trigger is a GoHighLevel Workflow
 // automation (configured in Pipely) that fires on the opportunity being
 // dragged into the "send deposit" pipeline stage, with this URL as a

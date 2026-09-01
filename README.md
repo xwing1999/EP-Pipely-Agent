@@ -1,11 +1,15 @@
 # Everest Plunge Pipely ↔ Xero Agent
 
-Four jobs — the first is Pipely-only, the rest are between Pipely and Xero:
+Five jobs — the first two are Pipely-only, the rest are between Pipely and Xero:
 
-0. **Deal visibility** (read-only, Pipely-only) — lists all open Pipely
-   deals with pipeline/stage names resolved, for general tracking. Added
-   2026-09-01. Doesn't touch Xero at all — works even before Xero OAuth is
-   set up for this agent.
+0. **Deposit-to-won tracking** (read-only, Pipely-only) — the main thing to
+   watch day-to-day. Three numbers: deals currently sitting at "deposit
+   sent," deals won this month, deals won all time. Scoped to Joel's
+   pipeline only (the only active sales rep). Added 2026-09-01.
+0.5. **Deal visibility** (read-only, Pipely-only) — the broader primitive
+   deposit-to-won tracking is built on; lists all open Pipely deals with
+   pipeline/stage names resolved. Not the thing to check day-to-day, just
+   useful for exploring the raw data. Added 2026-09-01.
 1. **Reconciliation** (read-only) — checks that won Pipely deals have a
    matching invoice in Xero, flags anything that doesn't line up.
 2. **Deposit invoicing** (write) — creates and emails a booking-deposit
@@ -16,7 +20,40 @@ Four jobs — the first is Pipely-only, the rest are between Pipely and Xero:
    release. Added 2026-08-31 alongside the stock sheet agent's release
    gate — see below.
 
-## Deal visibility
+## Deposit-to-won tracking
+
+`GET /admin/deposit-to-won` — the main endpoint to check. Returns exactly
+three columns, per Xavier's explicit scope ("these are the 3 that we will
+be watching over solely"):
+
+```json
+{
+  "depositSent": { "count": 0, "deals": [...] },
+  "wonThisMonth": { "count": 0, "deals": [...] },
+  "wonAllTime": { "count": 0, "deals": [...] }
+}
+```
+
+- `depositSent` — deals currently sitting in "2 - Joel - Pipeline"'s
+  "3.1 - WON - Deposit Invoice Sent" stage. Matched by stage, not
+  opportunity status (see code comment on why).
+- `wonThisMonth` / `wonAllTime` — deals with Pipely's own `status: 'won'`,
+  filtered by `lastStageChangeAt` falling in the current calendar month for
+  the first. **This "this month" figure is an approximation** — Pipely
+  doesn't expose a dedicated "became won" timestamp, so a deal that became
+  won two months ago and then moved stage again this month (e.g.
+  progressed from "Deposit Paid" to "Product To Send") would double-count
+  as won this month too. Watch this against what you know actually
+  happened before trusting it fully.
+- Depends on Joel's pipeline being correctly identified
+  (`JOEL_PIPELINE_ID` in `index.js`, hardcoded to the real, confirmed ID —
+  update it if that pipeline is ever recreated) and, going forward, on the
+  Pipely/GoHighLevel Workflow that flips an opportunity's status to "Won"
+  actually being configured to fire at the Deposit Paid stage rather than
+  Deposit Invoice Sent — that's a Pipely-side setting, not something this
+  code controls or verifies.
+
+## Deal visibility (general, not the main thing to watch)
 
 `GET /admin/deals` — returns every open Pipely opportunity (pass
 `?status=won`/`lost`/`abandoned` to look at other buckets instead), with
