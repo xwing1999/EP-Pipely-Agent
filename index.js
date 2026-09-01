@@ -852,6 +852,87 @@ app.get('/admin/deposit-to-won', async (_req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// INVOICE CHECK (added 2026-09-01) — per Xavier: "we want the pipely agent
+// to be able to compare over from the sales pipeline and make sure there
+// are invoices sitting there." This is the Pipely-only half of a two-part
+// check he described; the second half — cross-checking each invoice's
+// payment status against Xero, since "Xero is our true accounting
+// software... an invoice reconciled as paid in Xero needs to be showing
+// paid in Pipely" — is NOT built yet. It's blocked on this agent's Xero
+// OAuth actually being connected (XERO_CLIENT_ID/SECRET/REFRESH_TOKEN are
+// still unset — see the setup checklist further down this file), and on
+// confirming HOW a Pipely invoice and its Xero counterpart are meant to
+// line up (no confirmed shared key seen yet — these 124 real invoices
+// carry Pipely's own `estimateId`/`invoiceNumber`, nothing recognizable as
+// a Xero reference). Don't guess that matching key — confirm with Xavier
+// once Xero is connected and a real synced pair can be inspected.
+//
+// What IS confirmed real: every Pipely invoice carries `opportunityId`,
+// an exact match against the opportunity's own `id` — no fuzzy matching
+// needed for this half, unlike the email-based reconciliation elsewhere
+// in this file.
+// ---------------------------------------------------------------------------
+app.get('/admin/invoice-check', async (_req, res) => {
+  try {
+    const [allOpportunities, invoices, pipelines] = await Promise.all([
+      fetchPipelyOpportunities(),
+      fetchPipelyInvoices(),
+      fetchPipelyPipelines()
+    ]);
+
+    // Every stage across tracked pipelines from "Deposit Invoice Sent"
+    // onward — any deal that's reached one of these should have an
+    // invoice by now.
+    const wonStageLabelById = new Map();
+    for (const { id } of TRACKED_PIPELINES) {
+      const pipeline = pipelines.find((p) => p.id === id);
+      for (const s of pipeline?.stages ?? []) {
+        const label = normalizeWonStageLabel(s.name);
+        if (label) wonStageLabelById.set(s.id, label);
+      }
+    }
+
+    const invoiceByOpportunityId = new Map();
+    for (const inv of invoices) {
+      if (inv.opportunityId) invoiceByOpportunityId.set(inv.opportunityId, inv);
+    }
+
+    const checked = [];
+    for (const o of allOpportunities) {
+      const stage = wonStageLabelById.get(o.pipelineStageId);
+      if (!stage) continue; // not far enough along to be expected to have an invoice
+
+      const rep = TRACKED_PIPELINES.find((p) => p.id === o.pipelineId)?.rep;
+      const invoice = invoiceByOpportunityId.get(o.id);
+
+      checked.push({
+        opportunityId: o.id,
+        dealName: o.name,
+        rep,
+        stage,
+        dealValue: o.monetaryValue,
+        hasInvoice: Boolean(invoice),
+        invoiceNumber: invoice?.invoiceNumber ?? null,
+        invoiceStatus: invoice?.status ?? null, // Pipely's own status — 'paid'/'sent'/'partially_paid' seen live
+        invoiceTotal: invoice?.invoiceTotal ?? null,
+        amountDue: invoice?.amountDue ?? null
+      });
+    }
+
+    const missingInvoice = checked.filter((c) => !c.hasInvoice);
+
+    res.json({
+      count: checked.length,
+      missingInvoiceCount: missingInvoice.length,
+      missingInvoice,
+      deals: checked
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // DEPOSIT INVOICE WEBHOOK — intended trigger is a GoHighLevel Workflow
 // automation (configured in Pipely) that fires on the opportunity being
 // dragged into the "send deposit" pipeline stage, with this URL as a
