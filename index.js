@@ -733,6 +733,27 @@ app.get('/admin/pipelines', async (_req, res) => {
   }
 });
 
+// Diagnostic (added 2026-09-01) — raw Xero contact + invoices for one
+// email, to answer a real question that came up while testing: does Xero
+// actually have ANY invoices for deals Pipely shows as paid, or none at
+// all (i.e. Pipely's invoicing might not sync into Xero at all)? Not a
+// permanent feature — remove once that's answered and any resulting build
+// decision is made.
+app.get('/admin/xero-contact-check', async (req, res) => {
+  const email = req.query.email;
+  if (!email) return res.status(400).json({ error: 'email query param is required' });
+  try {
+    const contacts = await xeroRequest('Contacts', { params: { where: `EmailAddress=="${email}"` } });
+    const contactIds = (contacts.Contacts ?? []).map((c) => c.ContactID);
+    const invoices = contactIds.length
+      ? await xeroRequest('Invoices', { params: { ContactIDs: contactIds.join(',') } })
+      : { Invoices: [] };
+    res.json({ contacts: contacts.Contacts ?? [], invoices: invoices.Invoices ?? [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Raw pass-through of Pipely's own Invoicing feature — added 2026-09-01 to
 // see the real shape before deciding what (if anything) needs shaping into
 // its own tracked view, same discovery-first approach as /admin/pipelines.
