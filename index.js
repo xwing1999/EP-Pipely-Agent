@@ -975,11 +975,13 @@ app.get('/admin/invoice-check', async (_req, res) => {
     // pipelines' WON stages; not worth the complexity of batching via
     // Xero's InvoiceNumbers= param at this scale.
     for (const c of checked) {
-      if (!c._xeroInvoiceNumber) continue;
+      const xeroInvoiceNumber = c._xeroInvoiceNumber;
+      delete c._xeroInvoiceNumber;
+      if (!xeroInvoiceNumber) continue;
       try {
-        const xeroResult = await xeroRequest('Invoices', { params: { InvoiceNumbers: c._xeroInvoiceNumber } });
+        const xeroResult = await xeroRequest('Invoices', { params: { InvoiceNumbers: xeroInvoiceNumber } });
         const xeroInvoice = xeroResult.Invoices?.[0] ?? null;
-        c.xeroInvoiceNumber = c._xeroInvoiceNumber;
+        c.xeroInvoiceNumber = xeroInvoiceNumber;
         c.xeroFound = Boolean(xeroInvoice);
         c.xeroStatus = xeroInvoice?.Status ?? null;
         c.xeroAmountDue = xeroInvoice ? Number(xeroInvoice.AmountDue ?? 0) : null;
@@ -987,7 +989,6 @@ app.get('/admin/invoice-check', async (_req, res) => {
       } catch (err) {
         c.xeroCheckError = err.message;
       }
-      delete c._xeroInvoiceNumber;
     }
 
     const missingInvoice = checked.filter((c) => !c.hasInvoice);
