@@ -75,15 +75,24 @@ NEEDS_SKU_FILE=/data/pipely-needs-sku.json
 
 # --- Final invoice sweep (added 2026-09-01) — REQUIRES STOCK_SHEET_AGENT_URL/
 # _API_KEY above to be set. Periodically checks every order in the stock
-# sheet's Automation Log for a "Ship Target Date" within this many days —
-# ops enters that date manually as containers' arrival estimates become
-# known — and automatically creates + emails the final 50% Xero invoice for
-# any that qualify and haven't been invoiced yet. No human approval step,
-# by Xavier's explicit choice. Safe to run repeatedly: reuses the same
+# sheet's Automation Log for a batch/shipment ETA (set once per batch in the
+# ops console, resolved per order as "Ship ETA") within this many days — and
+# automatically creates + emails the final 50% Xero invoice for any that
+# qualify and haven't been invoiced yet. No human approval step, by
+# Xavier's explicit choice. Safe to run repeatedly: reuses the same
 # idempotent createFinalInvoice used by the human-triggered endpoint, so it
 # can't double-invoice an order it already handled.
 FINAL_INVOICE_LEAD_DAYS=7
 FINAL_SWEEP_INTERVAL_MINUTES=60
 FINAL_SWEEP_LOG_FILE=/data/final-invoice-sweep-log.json
+
+# --- Deposit-paid stage sync (added 2026-09-01) — closes the gap where a
+# sales rep in Pipely has no way to see a deposit's real payment status,
+# since deposit invoices are created directly in Xero. Periodically checks
+# Xero for each tracked deal sitting at "Deposit Invoice Sent" and, once
+# paid, moves it to Pipely's own "Deposit Paid" stage automatically — no
+# new screen needed, visible right in the pipeline reps already use.
+DEPOSIT_SYNC_INTERVAL_MINUTES=60
+DEPOSIT_SYNC_LOG_FILE=/data/deposit-sync-log.json
 
 PORT=3008

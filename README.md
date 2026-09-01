@@ -30,6 +30,12 @@ Five jobs — the first two are Pipely-only, the rest are between Pipely and Xer
 4. **Final invoice sweep** (write, fully automatic, added 2026-09-01) —
    periodically checks every order's batch ETA and fires the final invoice
    once it's within the lead-time window. See below.
+5. **Deposit-paid stage sync** (write to Pipely, fully automatic, added
+   2026-09-01) — since deposit/final invoices are created directly in
+   Xero (not in Pipely), a sales rep in Pipely had no way to see whether a
+   deposit was actually paid. Closes that gap by moving the deal to
+   Pipely's own "Deposit Paid" stage automatically once Xero confirms
+   payment. See below.
 
 ## Deposit-to-won tracking
 
@@ -176,6 +182,37 @@ sets it once via the ops console's "Batch ETA" section.
 days-until-arrival) still qualifies, it doesn't get skipped for being
 late; the sweep doesn't distinguish "about to arrive" from "should have
 arrived already," both are inside the lead-time window.
+
+## Deposit-paid stage sync (added 2026-09-01)
+
+The first write this agent makes to a Pipely opportunity — every other
+Pipely call in this file is read-only. Closes a real gap: "where will the
+sales rep check to see if deposits have been paid if it's not been
+invoiced in pipely" — since deposit invoices go directly into Xero, a rep
+in Pipely had no visibility. Rather than build a separate status screen,
+this automatically drags the deal into Pipely's own existing "Deposit
+Paid" stage once Xero confirms the deposit invoice is paid — visible
+right inside the pipeline reps already use.
+
+Every `DEPOSIT_SYNC_INTERVAL_MINUTES` (default 60), and once immediately
+on startup: for every tracked-pipeline opportunity currently at "Deposit
+Invoice Sent," checks Xero for that deal's deposit invoice (`Reference ==
+"Deposit - {opportunityId}"`, excluding VOIDED/DELETED — same query
+`createDepositInvoiceLocked`'s idempotency check already uses). If it's
+paid (`AmountDue <= 0`), moves the opportunity to "Deposit Paid" via
+`PUT /opportunities/:id` (`updatePipelyOpportunityStage` in `index.js`).
+Naturally idempotent — an opportunity that's moved on no longer matches
+the "Deposit Invoice Sent" filter, so it's simply not picked up again.
+
+- `GET /admin/deposit-sync-log` — failures from past syncs.
+- `POST /admin/run-deposit-sync` — trigger a sync immediately.
+
+**Not yet exercised against the real account.** GoHighLevel's documented
+`PUT /opportunities/:id` needs `Version: v3` in the header — every read
+call elsewhere in this file uses `Version: 2021-07-28`. If the first real
+run throws a version or auth-shaped error, that header is the first thing
+to check. Also requires both `pipelineId` and `pipelineStageId` in the
+same request (stage alone isn't accepted per GHL's docs).
 
 ## Reconciliation
 

@@ -324,6 +324,30 @@ async function fetchPipelyOpportunity(opportunityId) {
   return data.opportunity ?? data;
 }
 
+// First write this codebase makes to a Pipely opportunity — every other
+// Pipely call in this file is read-only. Added 2026-09-01 for the
+// deposit-paid stage sync (see that section below). GoHighLevel's
+// documented PUT /opportunities/:id requires BOTH pipelineId and
+// pipelineStageId together (setting stage alone isn't accepted), and
+// docs list the header as `Version: v3` — a different value than every
+// read call in this file uses (`2021-07-28`). Not yet exercised against
+// the real account; if this throws a version/auth error on first real
+// use, that header is the first thing to check.
+async function updatePipelyOpportunityStage(opportunityId, pipelineId, pipelineStageId) {
+  const res = await fetch(`${PIPELY_BASE_URL}/opportunities/${opportunityId}`, {
+    method: 'PUT',
+    headers: {
+      Authorization: `Bearer ${process.env.PIPELY_API_KEY}`,
+      Version: 'v3',
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ pipelineId, pipelineStageId })
+  });
+  if (!res.ok) throw new Error(`Pipely opportunity update error ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+  return data.opportunity ?? data;
+}
+
 // ---------------------------------------------------------------------------
 // DEPOSIT INVOICING (added 2026-08-24) — Xavier confirmed the booking
 // deposit invoice should go out automatically the moment a deal is marked
@@ -950,6 +974,110 @@ function summarizeTrackedDeal(o, extra = {}) {
     ...extra
   };
 }
+
+// ---------------------------------------------------------------------------
+// DEPOSIT-PAID STAGE SYNC (added 2026-09-01) — closes a real gap Xavier
+// raised: deposit invoices are created directly in Xero (see DEPOSIT
+// INVOICING above), so a sales rep looking at Pipely — "this is where the
+// sales reps live" — would have no way to see whether a deposit has
+// actually been paid. Rather than build a separate status screen,
+// automatically drags the deal into Pipely's own existing "Deposit Paid"
+// stage once Xero confirms it — visible right inside the pipeline reps
+// already use, no new screen needed.
+//
+// Runs on the same periodic-timer pattern as the other sweeps. For every
+// tracked-pipeline opportunity currently sitting at "Deposit Invoice
+// Sent", checks Xero for that deal's deposit invoice (same Reference
+// pattern createDepositInvoiceLocked's idempotency check already uses:
+// "Deposit - {opportunityId}", excluding VOIDED/DELETED) — if it's paid
+// (AmountDue <= 0), moves the opportunity to "Deposit Paid" via
+// updatePipelyOpportunityStage. Naturally idempotent: an opportunity
+// already at or past "Deposit Paid" won't be at the "Deposit Invoice
+// Sent" stage anymore, so it's simply not selected on the next run.
+// ---------------------------------------------------------------------------
+const DEPOSIT_SYNC_INTERVAL_MINUTES = Number(process.env.DEPOSIT_SYNC_INTERVAL_MINUTES ?? 60);
+const DEPOSIT_SYNC_LOG_FILE = process.env.DEPOSIT_SYNC_LOG_FILE || '/data/deposit-sync-log.json';
+
+function loadDepositSyncLog() {
+  try { return JSON.parse(fs.readFileSync(DEPOSIT_SYNC_LOG_FILE, 'utf8')); } catch { return []; }
+}
+function appendDepositSyncLog(entry) {
+  const log = loadDepositSyncLog();
+  log.push({ ...entry, at: new Date().toISOString() });
+  try {
+    fs.mkdirSync(path.dirname(DEPOSIT_SYNC_LOG_FILE), { recursive: true });
+    fs.writeFileSync(DEPOSIT_SYNC_LOG_FILE, JSON.stringify(log, null, 2));
+  } catch (err) {
+    console.warn('Could not persist deposit-sync log to disk:', err.message);
+  }
+}
+
+async function runDepositPaidSync() {
+  const [opportunities, pipelines] = await Promise.all([
+    fetchPipelyOpportunities(),
+    fetchPipelyPipelines()
+  ]);
+
+  // Per tracked pipeline, resolve both stage IDs by label — each pipeline
+  // has its own copy of these stages with a different ID.
+  const stageIdsByPipeline = new Map(); // pipelineId -> { depositSentId, depositPaidId }
+  for (const { id } of TRACKED_PIPELINES) {
+    const pipeline = pipelines.find((p) => p.id === id);
+    const depositSentId = (pipeline?.stages ?? []).find((s) => normalizeWonStageLabel(s.name) === 'Deposit Invoice Sent')?.id;
+    const depositPaidId = (pipeline?.stages ?? []).find((s) => normalizeWonStageLabel(s.name) === 'Deposit Paid')?.id;
+    if (depositSentId && depositPaidId) stageIdsByPipeline.set(id, { depositSentId, depositPaidId });
+  }
+
+  const candidates = opportunities.filter((o) => {
+    const stages = stageIdsByPipeline.get(o.pipelineId);
+    return stages && o.pipelineStageId === stages.depositSentId;
+  });
+
+  const results = [];
+  for (const opp of candidates) {
+    try {
+      const reference = `Deposit - ${opp.id}`;
+      const invoiceData = await xeroRequest('Invoices', { params: { where: `Reference=="${reference}"&&Status!="VOIDED"&&Status!="DELETED"` } });
+      const invoice = invoiceData.Invoices?.[0];
+      if (!invoice) { results.push({ opportunityId: opp.id, ok: true, action: 'skipped — no deposit invoice yet' }); continue; }
+      if (Number(invoice.AmountDue ?? 0) > 0.01) { results.push({ opportunityId: opp.id, ok: true, action: 'skipped — not yet paid' }); continue; }
+
+      const { depositPaidId } = stageIdsByPipeline.get(opp.pipelineId);
+      await updatePipelyOpportunityStage(opp.id, opp.pipelineId, depositPaidId);
+      results.push({ opportunityId: opp.id, ok: true, action: 'moved to Deposit Paid' });
+      console.log(`Deposit sync: opportunity ${opp.id} moved to Deposit Paid stage.`);
+    } catch (err) {
+      results.push({ opportunityId: opp.id, ok: false, error: err.message });
+      appendDepositSyncLog({ opportunityId: opp.id, error: err.message });
+      console.error(`Deposit sync FAILED for opportunity ${opp.id}:`, err.message);
+    }
+  }
+
+  console.log(`Deposit sync: ${candidates.length} deals at "Deposit Invoice Sent" checked, ${results.filter((r) => r.action === 'moved to Deposit Paid').length} moved to Deposit Paid.`);
+  return results;
+}
+
+let depositSyncTimer = null;
+function scheduleDepositPaidSync() {
+  runDepositPaidSync().catch((err) => console.error('Initial deposit-paid sync failed:', err.message));
+  depositSyncTimer = setInterval(() => {
+    runDepositPaidSync().catch((err) => console.error('Scheduled deposit-paid sync failed:', err.message));
+  }, DEPOSIT_SYNC_INTERVAL_MINUTES * 60 * 1000);
+}
+scheduleDepositPaidSync();
+
+app.get('/admin/deposit-sync-log', (_req, res) => {
+  res.json({ failures: loadDepositSyncLog() });
+});
+
+app.post('/admin/run-deposit-sync', async (_req, res) => {
+  try {
+    const results = await runDepositPaidSync();
+    res.json({ ok: true, checked: results.length, results });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 app.get('/admin/deposit-to-won', async (_req, res) => {
   try {
