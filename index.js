@@ -883,24 +883,40 @@ app.get('/admin/deposit-to-won', async (_req, res) => {
 // ---------------------------------------------------------------------------
 // INVOICE CHECK (added 2026-09-01) — per Xavier: "we want the pipely agent
 // to be able to compare over from the sales pipeline and make sure there
-// are invoices sitting there." This is the Pipely-only half of a two-part
-// check he described; the second half — cross-checking each invoice's
-// payment status against Xero, since "Xero is our true accounting
-// software... an invoice reconciled as paid in Xero needs to be showing
-// paid in Pipely" — is NOT built yet. It's blocked on this agent's Xero
-// OAuth actually being connected (XERO_CLIENT_ID/SECRET/REFRESH_TOKEN are
-// still unset — see the setup checklist further down this file), and on
-// confirming HOW a Pipely invoice and its Xero counterpart are meant to
-// line up (no confirmed shared key seen yet — these 124 real invoices
-// carry Pipely's own `estimateId`/`invoiceNumber`, nothing recognizable as
-// a Xero reference). Don't guess that matching key — confirm with Xavier
-// once Xero is connected and a real synced pair can be inspected.
+// are invoices sitting there... because Xero is our true accounting
+// software we need the pipely agent to check with the Xero agent that
+// everything matches up. For example an invoice reconciled as paid in
+// Xero needs to be showing paid in Pipely." Both halves now built.
 //
-// What IS confirmed real: every Pipely invoice carries
-// `opportunityDetails.opportunityId`, an exact match against the
-// opportunity's own `id` — no fuzzy matching needed for this half, unlike
-// the email-based reconciliation elsewhere in this file.
+// Matching keys, both confirmed against real live data on 2026-09-01, NOT
+// guessed:
+// - Pipely invoice -> opportunity: `opportunityDetails.opportunityId`,
+//   exact match against the opportunity's own `id`.
+// - Pipely invoice -> Xero invoice: Xero's `InvoiceNumber` equals Pipely's
+//   `invoiceNumberPrefix + invoiceNumber` (e.g. "INV-" + "000155" =
+//   "INV-000155") — confirmed by cross-referencing a real invoice
+//   (Tess Gleeson, Pipely #000155 / Xero INV-000155) found via
+//   /admin/xero-contact-check. The original email+value-based
+//   reconciliation elsewhere in this file is NOT reliable for this
+//   purpose — many Pipely opportunities have `monetaryValue: 0` even when
+//   the real Xero invoice total is thousands of dollars, which is why
+//   that logic flagged every single won deal as a false mismatch when
+//   Xero was first connected.
+//
+// Known real gap: not every Pipely invoice has `opportunityDetails` set
+// (the Tess Gleeson one above has it null) — so hasInvoice/missingInvoice
+// below can undercount if an invoice exists but was never linked back to
+// its opportunity in Pipely. Flagged here rather than silently trusted.
 // ---------------------------------------------------------------------------
+function pipelyStatusMatchesXero(pipelyStatus, xeroInvoice) {
+  if (!xeroInvoice) return false;
+  const amountDue = Number(xeroInvoice.AmountDue ?? 0);
+  const amountPaid = Number(xeroInvoice.AmountPaid ?? 0);
+  if (pipelyStatus === 'paid') return amountDue <= 0.01 && amountPaid > 0.01;
+  if (pipelyStatus === 'sent') return amountPaid <= 0.01;
+  if (pipelyStatus === 'partially_paid') return amountPaid > 0.01 && amountDue > 0.01;
+  return null; // unrecognized Pipely status — can't judge, not a silent pass
+}
 app.get('/admin/invoice-check', async (_req, res) => {
   try {
     const [allOpportunities, invoices, pipelines] = await Promise.all([
@@ -948,16 +964,44 @@ app.get('/admin/invoice-check', async (_req, res) => {
         invoiceNumber: invoice?.invoiceNumber ?? null,
         invoiceStatus: invoice?.status ?? null, // Pipely's own status — 'paid'/'sent'/'partially_paid' seen live
         invoiceTotal: invoice?.invoiceTotal ?? null,
-        amountDue: invoice?.amountDue ?? null
+        amountDue: invoice?.amountDue ?? null,
+        _xeroInvoiceNumber: invoice ? `${invoice.invoiceNumberPrefix ?? ''}${invoice.invoiceNumber}` : null
       });
     }
 
+    // Cross-check each matched invoice against Xero, by the confirmed
+    // InvoiceNumber key. Sequential, not parallel — this list stays small
+    // (currently single digits) since it's already narrowed to tracked
+    // pipelines' WON stages; not worth the complexity of batching via
+    // Xero's InvoiceNumbers= param at this scale.
+    for (const c of checked) {
+      if (!c._xeroInvoiceNumber) continue;
+      try {
+        const xeroResult = await xeroRequest('Invoices', { params: { InvoiceNumbers: c._xeroInvoiceNumber } });
+        const xeroInvoice = xeroResult.Invoices?.[0] ?? null;
+        c.xeroInvoiceNumber = c._xeroInvoiceNumber;
+        c.xeroFound = Boolean(xeroInvoice);
+        c.xeroStatus = xeroInvoice?.Status ?? null;
+        c.xeroAmountDue = xeroInvoice ? Number(xeroInvoice.AmountDue ?? 0) : null;
+        c.statusMatchesXero = pipelyStatusMatchesXero(c.invoiceStatus, xeroInvoice);
+      } catch (err) {
+        c.xeroCheckError = err.message;
+      }
+      delete c._xeroInvoiceNumber;
+    }
+
     const missingInvoice = checked.filter((c) => !c.hasInvoice);
+    const statusMismatch = checked.filter((c) => c.hasInvoice && c.statusMatchesXero === false);
+    const notFoundInXero = checked.filter((c) => c.hasInvoice && c.xeroFound === false);
 
     res.json({
       count: checked.length,
       missingInvoiceCount: missingInvoice.length,
       missingInvoice,
+      statusMismatchCount: statusMismatch.length,
+      statusMismatch,
+      notFoundInXeroCount: notFoundInXero.length,
+      notFoundInXero,
       deals: checked
     });
   } catch (err) {

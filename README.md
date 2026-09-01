@@ -11,8 +11,14 @@ Five jobs — the first two are Pipely-only, the rest are between Pipely and Xer
    deposit-to-won tracking is built on; lists all open Pipely deals with
    pipeline/stage names resolved. Not the thing to check day-to-day, just
    useful for exploring the raw data. Added 2026-09-01.
+0.7. **Invoice check** (read-only, Pipely + Xero) — the other half of what
+   Xavier described: confirms every tracked deal has an invoice, and that
+   each invoice's Pipely status actually matches Xero. Added 2026-09-01,
+   see below — supersedes the older `1. Reconciliation` job below for
+   this purpose, kept for now since it's a different lookback/window.
 1. **Reconciliation** (read-only) — checks that won Pipely deals have a
-   matching invoice in Xero, flags anything that doesn't line up.
+   matching invoice in Xero, flags anything that doesn't line up. **Not
+   reliable** — see the note under Invoice check below.
 2. **Deposit invoicing** (write) — creates and emails a booking-deposit
    Xero invoice automatically when a deal reaches the "send deposit" stage
    in Pipely. Added 2026-08-24.
@@ -65,6 +71,47 @@ whatever the opportunity search response embeds — not a separate per-deal
 contact lookup, so this stays cheap even with a lot of open deals.
 
 `GET /admin/pipelines` — raw pipeline/stage list, for reference.
+
+## Invoice check (added 2026-09-01)
+
+`GET /admin/invoice-check` — the real two-way check Xavier asked for:
+"compare over from the sales pipeline and make sure there are invoices
+sitting there... an invoice reconciled as paid in Xero needs to be
+showing paid in Pipely."
+
+For every deal in a tracked pipeline (Joel, Dion) sitting at or past
+"Deposit Invoice Sent":
+- Confirms a Pipely invoice actually exists for it (matched by
+  `opportunityDetails.opportunityId`, exact).
+- If one exists, looks it up in Xero by `InvoiceNumber` — confirmed to
+  equal Pipely's `invoiceNumberPrefix + invoiceNumber` (e.g.
+  `"INV-000155"` for Pipely invoice `#000155`) — and compares payment
+  status: Pipely `paid` should mean Xero `AmountDue == 0`, `sent` should
+  mean nothing paid yet, `partially_paid` should mean partially paid on
+  both sides.
+
+Response has three flagged buckets plus the full list: `missingInvoice`
+(deal reached a WON stage, no Pipely invoice found), `notFoundInXero`
+(Pipely invoice exists, nothing in Xero with that InvoiceNumber),
+`statusMismatch` (both exist, but payment status disagrees — e.g. Pipely
+still shows "sent" while Xero shows it's actually been paid).
+
+**Known real gap**: not every Pipely invoice has `opportunityDetails` set
+— one found while testing (Tess Gleeson, real, paid, $5,922.50) had it
+`null` despite a genuine matching Xero invoice existing. This means
+`missingInvoice` can have false positives — a deal might actually have an
+invoice that simply isn't linked back to its opportunity in Pipely. Not
+fixable from this agent's side; worth asking Xavier whether that's
+something reps need to always set when creating invoices in Pipely.
+
+**Why `1. Reconciliation` above is unreliable for this purpose**: it
+matches by contact email + comparing `Invoice.Total` against the Pipely
+opportunity's `monetaryValue` — but many real opportunities have
+`monetaryValue: 0` even when the actual Xero invoice is for thousands of
+dollars (reps aren't consistently filling that field in), so it flagged
+every single won deal as a mismatch the first time Xero was connected,
+none of which were real. `/admin/invoice-check` uses the confirmed
+InvoiceNumber key instead, not deal value.
 
 **Not yet verified against Everest Plunge's real Pipely account**: the
 `/opportunities/pipelines` response shape (`{pipelines: [{id, name, stages:
