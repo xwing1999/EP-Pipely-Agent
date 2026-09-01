@@ -265,6 +265,39 @@ async function fetchPipelyPipelines() {
   return data.pipelines ?? [];
 }
 
+// Pipely's OWN invoicing feature (GoHighLevel Invoices API) — distinct from
+// Xero invoices created elsewhere in this file. Not yet confirmed against
+// Everest Plunge's real account (added 2026-09-01, endpoint shape taken
+// from GoHighLevel's documented Invoices API: GET /invoices/?altId=
+// {locationId}&altType=location). Paginated via `limit`/`offset` per GHL's
+// documented shape — capped at 20 pages (2000 invoices) same as the
+// opportunities fetchers, logged if hit rather than silently truncating.
+async function fetchPipelyInvoices() {
+  if (!process.env.PIPELY_API_KEY) throw new Error('PIPELY_API_KEY not configured');
+  if (!process.env.PIPELY_LOCATION_ID) throw new Error('PIPELY_LOCATION_ID not configured');
+
+  const all = [];
+  const limit = 100;
+  for (let page = 0; page < 20; page++) {
+    const params = new URLSearchParams({
+      altId: process.env.PIPELY_LOCATION_ID,
+      altType: 'location',
+      limit: String(limit),
+      offset: String(page * limit)
+    });
+    const res = await fetch(`${PIPELY_BASE_URL}/invoices/?${params}`, {
+      headers: { Authorization: `Bearer ${process.env.PIPELY_API_KEY}`, Version: '2021-07-28' }
+    });
+    if (!res.ok) throw new Error(`Pipely invoices error ${res.status}: ${await res.text()}`);
+    const data = await res.json();
+    const batch = data.invoices ?? data.data ?? [];
+    all.push(...batch);
+    if (batch.length < limit) break;
+    if (page === 19) console.warn('fetchPipelyInvoices hit the 2000-invoice pagination cap — results may be incomplete.');
+  }
+  return all;
+}
+
 async function fetchPipelyContact(contactId) {
   const res = await fetch(`${PIPELY_BASE_URL}/contacts/${contactId}`, {
     headers: { Authorization: `Bearer ${process.env.PIPELY_API_KEY}`, Version: '2021-07-28' }
@@ -687,6 +720,18 @@ app.get('/admin/deals', async (req, res) => {
 app.get('/admin/pipelines', async (_req, res) => {
   try {
     res.json({ pipelines: await fetchPipelyPipelines() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Raw pass-through of Pipely's own Invoicing feature — added 2026-09-01 to
+// see the real shape before deciding what (if anything) needs shaping into
+// its own tracked view, same discovery-first approach as /admin/pipelines.
+app.get('/admin/invoices', async (_req, res) => {
+  try {
+    const invoices = await fetchPipelyInvoices();
+    res.json({ count: invoices.length, invoices });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
