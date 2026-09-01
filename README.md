@@ -4,8 +4,9 @@ Five jobs — the first two are Pipely-only, the rest are between Pipely and Xer
 
 0. **Deposit-to-won tracking** (read-only, Pipely-only) — the main thing to
    watch day-to-day. Three numbers: deals currently sitting at "deposit
-   sent," deals won this month, deals won all time. Scoped to Joel's
-   pipeline only (the only active sales rep). Added 2026-09-01.
+   sent," deals won this month, deals won all time. Scoped to Joel's and
+   Dion's pipelines (the active/soon-to-be-active sales reps — see
+   `TRACKED_PIPELINES` in `index.js`). Added 2026-09-01.
 0.5. **Deal visibility** (read-only, Pipely-only) — the broader primitive
    deposit-to-won tracking is built on; lists all open Pipely deals with
    pipeline/stage names resolved. Not the thing to check day-to-day, just
@@ -34,9 +35,10 @@ be watching over solely"):
 }
 ```
 
-- `depositSent` — deals currently sitting in "2 - Joel - Pipeline"'s
-  "3.1 - WON - Deposit Invoice Sent" stage. Matched by stage, not
-  opportunity status (see code comment on why).
+- `depositSent` — deals currently sitting in the "Deposit Invoice Sent"
+  stage of any tracked pipeline (Joel, Dion). Matched by stage, not
+  opportunity status (see code comment on why). Each deal is tagged with
+  `rep` so you can tell them apart.
 - `wonThisMonth` / `wonAllTime` — deals with Pipely's own `status: 'won'`,
   filtered by `lastStageChangeAt` falling in the current calendar month for
   the first. **This "this month" figure is an approximation** — Pipely

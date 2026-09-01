@@ -708,8 +708,14 @@ app.get('/admin/pipelines', async (_req, res) => {
 // Confirmed against the real Pipely account (2026-09-01): "2 - Joel -
 // Pipeline" has a 5-stage WON sequence, the first being
 // "3.1 - WON - Deposit Invoice Sent" — the depositSent bucket below.
-// Hardcoded to Joel's real pipeline ID (confirmed live, not guessed) per
-// Xavier's explicit narrowing — revisit if a second rep goes active.
+// Hardcoded to real pipeline IDs (confirmed live, not guessed).
+//
+// Also tracks "2 - Dion - Pipeline" (added same day, same real-ID
+// discipline) — Dion is Everest Plunge's founder/director, not currently
+// doing sales, but Xavier said he will be soon, so track it now rather
+// than waiting to add it later. Same identical WON stage sequence
+// confirmed live. If a rep's pipeline is ever recreated (new ID), update
+// TRACKED_PIPELINES below.
 //
 // depositSent is matched by STAGE, not opportunity status — Xavier also
 // said the same day "we need to only flick a job to the Won status once a
@@ -730,7 +736,10 @@ app.get('/admin/pipelines', async (_req, res) => {
 // too. Flagged here rather than silently treated as exact; revisit if it
 // produces a visibly wrong count once real data is watched over time.
 // ---------------------------------------------------------------------------
-const JOEL_PIPELINE_ID = 'IHzw1og6HSaa5TxKbLTX'; // "2 - Joel - Pipeline", confirmed live 2026-09-01
+const TRACKED_PIPELINES = [
+  { id: 'IHzw1og6HSaa5TxKbLTX', rep: 'Joel' }, // "2 - Joel - Pipeline", confirmed live 2026-09-01
+  { id: 'UOoyzw59VqVIYfsSQydC', rep: 'Dion' }  // "2 - Dion - Pipeline", confirmed live 2026-09-01
+];
 const WON_STAGE_LABEL_RE = /WON\s*-\s*(.+)$/i;
 
 function normalizeWonStageLabel(stageName) {
@@ -745,7 +754,7 @@ function isThisCalendarMonth(dateStr) {
   return d.getUTCFullYear() === now.getUTCFullYear() && d.getUTCMonth() === now.getUTCMonth();
 }
 
-function summarizeTrackedDeal(o) {
+function summarizeTrackedDeal(o, extra = {}) {
   return {
     id: o.id,
     name: o.name,
@@ -754,7 +763,8 @@ function summarizeTrackedDeal(o) {
     contactName: o.contact?.name || [o.contact?.firstName, o.contact?.lastName].filter(Boolean).join(' ') || null,
     contactEmail: o.contact?.email || null,
     contactPhone: o.contact?.phone || null,
-    lastStageChangeAt: o.lastStageChangeAt
+    lastStageChangeAt: o.lastStageChangeAt,
+    ...extra
   };
 }
 
@@ -766,15 +776,22 @@ app.get('/admin/deposit-to-won', async (_req, res) => {
       fetchPipelyPipelines()
     ]);
 
-    const joelPipeline = pipelines.find((p) => p.id === JOEL_PIPELINE_ID);
-    const depositSentStageId = (joelPipeline?.stages ?? [])
-      .find((s) => normalizeWonStageLabel(s.name) === 'Deposit Invoice Sent')?.id;
+    // Per tracked pipeline, find its "Deposit Invoice Sent" stage ID — each
+    // rep pipeline has its own copy of that stage with a different ID, even
+    // though the name pattern is identical.
+    const depositSentStageIdByPipeline = new Map();
+    for (const { id, rep } of TRACKED_PIPELINES) {
+      const pipeline = pipelines.find((p) => p.id === id);
+      const stageId = (pipeline?.stages ?? [])
+        .find((s) => normalizeWonStageLabel(s.name) === 'Deposit Invoice Sent')?.id;
+      if (stageId) depositSentStageIdByPipeline.set(stageId, rep);
+    }
 
     const depositSentDeals = allOpportunities
-      .filter((o) => o.pipelineId === JOEL_PIPELINE_ID && o.pipelineStageId === depositSentStageId)
-      .map(summarizeTrackedDeal);
+      .filter((o) => depositSentStageIdByPipeline.has(o.pipelineStageId))
+      .map((o) => summarizeTrackedDeal(o, { rep: depositSentStageIdByPipeline.get(o.pipelineStageId) }));
 
-    const wonAllTimeDeals = wonOpportunities.map(summarizeTrackedDeal);
+    const wonAllTimeDeals = wonOpportunities.map((o) => summarizeTrackedDeal(o));
     const wonThisMonthDeals = wonOpportunities
       .filter((o) => isThisCalendarMonth(o.lastStageChangeAt ?? o.createdAt))
       .map(summarizeTrackedDeal);
