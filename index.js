@@ -213,14 +213,19 @@ app.get('/oauth/callback', async (req, res) => {
 // ---------------------------------------------------------------------------
 const PIPELY_BASE_URL = process.env.PIPELY_BASE_URL || 'https://services.leadconnectorhq.com';
 
-async function fetchPipelyWonOpportunities(sinceDate) {
+// Shared paginated fetch — used both for reconciliation (status: 'won') and
+// the general deal-visibility endpoint below (status: 'open'). GHL's
+// documented status enum for opportunities is open/won/lost/abandoned;
+// omitting `status` entirely would return all of them.
+async function fetchPipelyOpportunities(status) {
   if (!process.env.PIPELY_API_KEY) throw new Error('PIPELY_API_KEY not configured');
   if (!process.env.PIPELY_LOCATION_ID) throw new Error('PIPELY_LOCATION_ID not configured');
 
   const all = [];
   let startAfter, startAfterId;
   for (let page = 0; page < 20; page++) {
-    const params = new URLSearchParams({ location_id: process.env.PIPELY_LOCATION_ID, limit: '100', status: 'won' });
+    const params = new URLSearchParams({ location_id: process.env.PIPELY_LOCATION_ID, limit: '100' });
+    if (status) params.set('status', status);
     if (startAfter) params.set('startAfter', startAfter);
     if (startAfterId) params.set('startAfterId', startAfterId);
     const res = await fetch(`${PIPELY_BASE_URL}/opportunities/search?${params}`, {
@@ -234,7 +239,30 @@ async function fetchPipelyWonOpportunities(sinceDate) {
     startAfter = String(data.meta.startAfter);
     startAfterId = data.meta.startAfterId;
   }
+  return all;
+}
+
+async function fetchPipelyWonOpportunities(sinceDate) {
+  const all = await fetchPipelyOpportunities('won');
   return sinceDate ? all.filter((o) => new Date(o.lastStageChangeAt ?? o.createdAt).getTime() >= sinceDate) : all;
+}
+
+// Pipeline/stage names — opportunities only carry pipelineId/pipelineStageId,
+// not human-readable names, so the deal-listing endpoint below resolves
+// them against this. Not verified against Everest Plunge's real account yet
+// (endpoint shape taken from GoHighLevel's documented API) — confirm the
+// response actually has {pipelines: [{id, name, stages: [{id, name}]}]}
+// once this is deployed and hit for real.
+async function fetchPipelyPipelines() {
+  if (!process.env.PIPELY_API_KEY) throw new Error('PIPELY_API_KEY not configured');
+  if (!process.env.PIPELY_LOCATION_ID) throw new Error('PIPELY_LOCATION_ID not configured');
+
+  const res = await fetch(`${PIPELY_BASE_URL}/opportunities/pipelines?locationId=${process.env.PIPELY_LOCATION_ID}`, {
+    headers: { Authorization: `Bearer ${process.env.PIPELY_API_KEY}`, Version: '2021-07-28' }
+  });
+  if (!res.ok) throw new Error(`Pipely pipelines error ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+  return data.pipelines ?? [];
 }
 
 async function fetchPipelyContact(contactId) {
@@ -609,6 +637,56 @@ app.post('/admin/run-check', async (_req, res) => {
   try {
     const mismatches = await runReconciliation();
     res.json({ ok: true, mismatchCount: mismatches.length, mismatches });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// DEAL VISIBILITY (added 2026-09-01) — Xavier wants to see all open Pipely
+// deals through this agent, for tracking, independent of the reconciliation/
+// invoicing logic above. Pipely-only — does not touch Xero, so this works
+// even before Xero OAuth is set up for this agent.
+// ---------------------------------------------------------------------------
+app.get('/admin/deals', async (req, res) => {
+  try {
+    const status = typeof req.query.status === 'string' ? req.query.status : 'open';
+    const [opportunities, pipelines] = await Promise.all([
+      fetchPipelyOpportunities(status),
+      fetchPipelyPipelines()
+    ]);
+
+    const pipelineNameById = new Map();
+    const stageNameById = new Map();
+    for (const p of pipelines) {
+      pipelineNameById.set(p.id, p.name);
+      for (const s of p.stages ?? []) stageNameById.set(s.id, s.name);
+    }
+
+    const deals = opportunities.map((o) => ({
+      id: o.id,
+      name: o.name,
+      value: o.monetaryValue,
+      status: o.status,
+      pipeline: pipelineNameById.get(o.pipelineId) || o.pipelineId,
+      stage: stageNameById.get(o.pipelineStageId) || o.pipelineStageId,
+      contactId: o.contactId,
+      contactName: o.contact?.name || [o.contact?.firstName, o.contact?.lastName].filter(Boolean).join(' ') || null,
+      contactEmail: o.contact?.email || null,
+      contactPhone: o.contact?.phone || null,
+      createdAt: o.createdAt,
+      lastStageChangeAt: o.lastStageChangeAt
+    }));
+
+    res.json({ count: deals.length, deals });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/admin/pipelines', async (_req, res) => {
+  try {
+    res.json({ pipelines: await fetchPipelyPipelines() });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

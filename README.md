@@ -1,7 +1,11 @@
 # Everest Plunge Pipely ↔ Xero Agent
 
-Three jobs, all between Pipely and Xero:
+Four jobs — the first is Pipely-only, the rest are between Pipely and Xero:
 
+0. **Deal visibility** (read-only, Pipely-only) — lists all open Pipely
+   deals with pipeline/stage names resolved, for general tracking. Added
+   2026-09-01. Doesn't touch Xero at all — works even before Xero OAuth is
+   set up for this agent.
 1. **Reconciliation** (read-only) — checks that won Pipely deals have a
    matching invoice in Xero, flags anything that doesn't line up.
 2. **Deposit invoicing** (write) — creates and emails a booking-deposit
@@ -11,6 +15,27 @@ Three jobs, all between Pipely and Xero:
    emails the remaining 50% once someone decides an order is ready to
    release. Added 2026-08-31 alongside the stock sheet agent's release
    gate — see below.
+
+## Deal visibility
+
+`GET /admin/deals` — returns every open Pipely opportunity (pass
+`?status=won`/`lost`/`abandoned` to look at other buckets instead), with
+`pipelineId`/`pipelineStageId` resolved to human-readable names via
+`GET /opportunities/pipelines`. Contact name/email/phone are read from
+whatever the opportunity search response embeds — not a separate per-deal
+contact lookup, so this stays cheap even with a lot of open deals.
+
+`GET /admin/pipelines` — raw pipeline/stage list, for reference.
+
+**Not yet verified against Everest Plunge's real Pipely account**: the
+`/opportunities/pipelines` response shape (`{pipelines: [{id, name, stages:
+[{id, name}]}]}`) and whether the opportunity search response actually
+embeds a usable `contact` object — both taken from GoHighLevel's documented
+API, not confirmed live yet. Check the first real `/admin/deals` response
+once deployed; if `pipeline`/`stage` come back as raw IDs instead of names,
+or contact fields are all `null`, the shape differs from what's assumed
+here and `fetchPipelyPipelines`/the `.map()` in `/admin/deals` need
+adjusting.
 
 ## Final payment invoicing
 
