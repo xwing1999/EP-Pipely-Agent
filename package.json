@@ -1,0 +1,15 @@
+{
+  "name": "everest-plunge-pipely-xero-agent",
+  "version": "1.0.0",
+  "description": "Two jobs for Everest Plunge's Pipely-Xero relationship: (1) reconciliation — checks won Pipely deals have a matching Xero invoice, flags anything that doesn't, read-only; (2) deposit invoicing — creates and emails a 50% booking-deposit Xero invoice when a GoHighLevel workflow fires on a deal reaching the 'send deposit' pipeline stage.",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "dotenv": "^16.4.5"
+  }
+}
