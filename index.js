@@ -659,11 +659,24 @@ async function runFinalInvoiceSweep() {
 }
 
 let finalSweepTimer = null;
+// PAUSE_AUTOMATION (added 2026-09-17) — Xavier: "nothing can be currently
+// edited apart from the console using AI... has to request each time...
+// until I'm happy with it." Gates only the SCHEDULED/automatic timer
+// firing below — the manual POST /admin/run-final-invoice-sweep and
+// /admin/run-deposit-sync endpoints deliberately still work even while
+// paused, since those only run when a human (via the AI) explicitly asks
+// for it right now, which is exactly what "has to request each time" means.
+function isAutomationPaused() {
+  return process.env.PAUSE_AUTOMATION === 'true';
+}
+
 function scheduleFinalInvoiceSweep() {
-  runFinalInvoiceSweep().catch((err) => console.error('Initial final-invoice sweep failed:', err.message));
-  finalSweepTimer = setInterval(() => {
-    runFinalInvoiceSweep().catch((err) => console.error('Scheduled final-invoice sweep failed:', err.message));
-  }, FINAL_SWEEP_INTERVAL_MINUTES * 60 * 1000);
+  const runIfNotPaused = (label) => {
+    if (isAutomationPaused()) { console.log(`Final-invoice sweep (${label}) skipped — automation paused.`); return; }
+    runFinalInvoiceSweep().catch((err) => console.error(`${label} final-invoice sweep failed:`, err.message));
+  };
+  runIfNotPaused('Initial');
+  finalSweepTimer = setInterval(() => runIfNotPaused('Scheduled'), FINAL_SWEEP_INTERVAL_MINUTES * 60 * 1000);
 }
 scheduleFinalInvoiceSweep();
 
@@ -1059,10 +1072,12 @@ async function runDepositPaidSync() {
 
 let depositSyncTimer = null;
 function scheduleDepositPaidSync() {
-  runDepositPaidSync().catch((err) => console.error('Initial deposit-paid sync failed:', err.message));
-  depositSyncTimer = setInterval(() => {
-    runDepositPaidSync().catch((err) => console.error('Scheduled deposit-paid sync failed:', err.message));
-  }, DEPOSIT_SYNC_INTERVAL_MINUTES * 60 * 1000);
+  const runIfNotPaused = (label) => {
+    if (isAutomationPaused()) { console.log(`Deposit-paid sync (${label}) skipped — automation paused.`); return; }
+    runDepositPaidSync().catch((err) => console.error(`${label} deposit-paid sync failed:`, err.message));
+  };
+  runIfNotPaused('Initial');
+  depositSyncTimer = setInterval(() => runIfNotPaused('Scheduled'), DEPOSIT_SYNC_INTERVAL_MINUTES * 60 * 1000);
 }
 scheduleDepositPaidSync();
 
@@ -1403,6 +1418,17 @@ app.post('/webhooks/pipely/deposit-trigger', async (req, res) => {
   // Xero calls below can exceed a typical webhook timeout, and GHL will
   // not retry this delivery either way once it gets a 200.
   res.status(200).send('OK');
+
+  // PAUSE_AUTOMATION (added 2026-09-17) — Xavier: "nothing can be currently
+  // edited apart from the console using AI... has to request each time...
+  // until I'm happy with it." Queued into the same deposit-failure log
+  // /admin/replay-deposit already knows how to reprocess, distinct reason
+  // so it isn't mistaken for a real failure.
+  if (process.env.PAUSE_AUTOMATION === 'true') {
+    console.log(`Opportunity ${opportunityId}: automation paused, queued for manual approval — not touching Xero.`);
+    appendDepositFailedLog({ opportunityId, error: 'PAUSED: automation paused, awaiting explicit approval' });
+    return;
+  }
 
   try {
     const opportunity = await fetchPipelyOpportunity(opportunityId);
