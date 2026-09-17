@@ -1296,8 +1296,10 @@ function pipelyStatusMatchesXero(pipelyStatus, xeroInvoice) {
   if (pipelyStatus === 'partially_paid') return amountPaid > 0.01 && amountDue > 0.01;
   return null; // unrecognized Pipely status — can't judge, not a silent pass
 }
-app.get('/admin/invoice-check', async (_req, res) => {
-  try {
+// Extracted to a plain function (2026-09-17) so both the live admin route
+// AND the scheduled cache-refresh job (see PAYMENT AUDIT CACHE below) share
+// one implementation — no behavior change from the route's own perspective.
+async function computeInvoiceCheck() {
     const [allOpportunities, invoices, pipelines] = await Promise.all([
       fetchPipelyOpportunities(),
       fetchPipelyInvoices(),
@@ -1537,7 +1539,7 @@ app.get('/admin/invoice-check', async (_req, res) => {
     // dropped or miscounted as a pass or a fail.
     const checkFailed = checked.filter((c) => c.xeroCheckError);
 
-    res.json({
+    return {
       count: checked.length,
       noInvoiceInXeroCount: noInvoiceInXero.length,
       noInvoiceInXero,
@@ -1548,7 +1550,91 @@ app.get('/admin/invoice-check', async (_req, res) => {
       checkFailedCount: checkFailed.length,
       checkFailed,
       deals: checked
-    });
+    };
+}
+
+app.get('/admin/invoice-check', async (_req, res) => {
+  try {
+    res.json(await computeInvoiceCheck());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// PAYMENT AUDIT CACHE REFRESH (added 2026-09-17) — Xavier: "I'm having a bit
+// of delay on loading times, the group needs to be backed in the
+// spreadsheet... I want everything to be recorded as it happens inside of
+// the spreadsheet. So the spreadsheet fully backs this sales view with all
+// the data possible." computeInvoiceCheck() makes several real (if batched)
+// Xero API calls — ~20s — which was making the console's Needs
+// Attention/Payment Audit pages slow on every single page load. This runs
+// that same computation on a schedule instead, and writes the result into
+// stock-sheet-agent's "Payment Audit Cache" tab — the console reads from
+// there (fast, a plain Sheets read) instead of triggering a live Xero check
+// every time someone opens the page.
+//
+// Read-only against Xero/Pipely (computeInvoiceCheck never writes to
+// either), and only writes to OUR OWN spreadsheet cache tab — not the kind
+// of edit PAUSE_AUTOMATION exists to gate (that's about writes to Xero/
+// Pipely, external systems of record). Runs regardless of the pause, same
+// as the existing (also read-only) reconciliation job.
+// ---------------------------------------------------------------------------
+const PAYMENT_AUDIT_CACHE_INTERVAL_MINUTES = Number(process.env.PAYMENT_AUDIT_CACHE_INTERVAL_MINUTES ?? 15);
+
+function summarizeXeroInvoices(invoices) {
+  if (!invoices || !invoices.length) return 'None found';
+  return invoices
+    .map((inv) => `${inv.invoiceNumber || '—'} ($${inv.total}, ${inv.amountDue > 0.01 ? `$${inv.amountDue} due` : 'paid'})`)
+    .join(' | ');
+}
+
+async function refreshPaymentAuditCache() {
+  if (!process.env.STOCK_SHEET_AGENT_URL) {
+    console.log('Payment-audit cache refresh skipped — STOCK_SHEET_AGENT_URL not configured.');
+    return;
+  }
+  const result = await computeInvoiceCheck();
+  const generatedAt = new Date().toISOString();
+  const rows = result.deals.map((d) => ({
+    opportunityId: d.opportunityId,
+    dealName: d.dealName,
+    rep: d.rep,
+    stage: d.stage,
+    dealValue: d.dealValue,
+    contactEmail: d.contactEmail,
+    noInvoiceInXero: result.noInvoiceInXero.some((x) => x.opportunityId === d.opportunityId),
+    statusMismatch: result.statusMismatch.some((x) => x.opportunityId === d.opportunityId),
+    notFoundInXero: result.notFoundInXero.some((x) => x.opportunityId === d.opportunityId),
+    checkFailed: Boolean(d.xeroCheckError),
+    xeroCheckError: d.xeroCheckError || '',
+    xeroInvoicesSummary: summarizeXeroInvoices(d.xeroInvoicesForContact),
+    xeroInvoicesForContact: d.xeroInvoicesForContact || [],
+    xeroTotalInvoicedToContact: d.xeroTotalInvoicedToContact ?? ''
+  }));
+
+  const res = await fetch(`${process.env.STOCK_SHEET_AGENT_URL}/admin/write-payment-audit-cache`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.STOCK_SHEET_AGENT_API_KEY },
+    body: JSON.stringify({ rows, generatedAt })
+  });
+  if (!res.ok) throw new Error(`Writing payment-audit cache failed: ${res.status} ${await res.text()}`);
+  console.log(`Payment-audit cache refreshed: ${rows.length} deals written, generated ${generatedAt}.`);
+}
+
+let paymentAuditCacheTimer = null;
+function schedulePaymentAuditCacheRefresh() {
+  refreshPaymentAuditCache().catch((err) => console.error('Initial payment-audit cache refresh failed:', err.message));
+  paymentAuditCacheTimer = setInterval(() => {
+    refreshPaymentAuditCache().catch((err) => console.error('Scheduled payment-audit cache refresh failed:', err.message));
+  }, PAYMENT_AUDIT_CACHE_INTERVAL_MINUTES * 60 * 1000);
+}
+schedulePaymentAuditCacheRefresh();
+
+app.post('/admin/refresh-payment-audit-cache', async (_req, res) => {
+  try {
+    await refreshPaymentAuditCache();
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
