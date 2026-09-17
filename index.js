@@ -1142,6 +1142,83 @@ app.post('/admin/run-deposit-sync', async (_req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// STUCK AT DEPOSIT INVOICE SENT (added 2026-09-17) — Xavier: "Dion isn't on
+// sales full-time and doesn't update it. So any jobs that are in 3.1 that
+// are actually deposit paid, that needs to be flagged to be moved over."
+// Read-only twin of runDepositPaidSync's own detection logic above (same
+// "Deposit - {id}" Reference check against Xero) — reports which deals are
+// stuck at "Deposit Invoice Sent" in Pipely despite Xero showing the
+// deposit already paid, WITHOUT moving them. Automation stays paused
+// (Xavier: "nothing can be currently edited apart from the console...
+// until I'm happy with it") — this only tells staff which ones need a
+// manual drag to "Deposit Paid" in Pipely.
+//
+// Batched, not one Xero call per candidate deal — /admin/invoice-check
+// already learned this lesson: sequential per-deal Xero calls reliably
+// trip the rate limit once there's more than a handful.
+// ---------------------------------------------------------------------------
+function chunkArray(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+app.get('/admin/stuck-deposit-paid', async (_req, res) => {
+  try {
+    const [opportunities, pipelines] = await Promise.all([
+      fetchPipelyOpportunities(),
+      fetchPipelyPipelines()
+    ]);
+
+    const depositSentIdByPipeline = new Map();
+    for (const { id } of TRACKED_PIPELINES) {
+      const pipeline = pipelines.find((p) => p.id === id);
+      const depositSentId = (pipeline?.stages ?? []).find((s) => normalizeWonStageLabel(s.name) === 'Deposit Invoice Sent')?.id;
+      if (depositSentId) depositSentIdByPipeline.set(id, depositSentId);
+    }
+
+    const candidates = opportunities.filter((o) => depositSentIdByPipeline.get(o.pipelineId) === o.pipelineStageId);
+
+    const invoiceByReference = new Map();
+    let checkError = null;
+    for (const batch of chunkArray(candidates, 15)) {
+      if (!batch.length) continue;
+      const clause = batch.map((o) => `Reference=="Deposit - ${o.id}"`).join('||');
+      try {
+        const result = await xeroRequest('Invoices', { params: { where: `(${clause})&&Status!="VOIDED"&&Status!="DELETED"` } });
+        for (const inv of result.Invoices ?? []) {
+          if (inv.Reference) invoiceByReference.set(inv.Reference, inv);
+        }
+      } catch (err) {
+        checkError = err.message;
+      }
+    }
+
+    const stuck = [];
+    const checkFailed = [];
+    for (const opp of candidates) {
+      const rep = TRACKED_PIPELINES.find((p) => p.id === opp.pipelineId)?.rep;
+      if (checkError) { checkFailed.push({ opportunityId: opp.id, dealName: opp.name, rep, checkError }); continue; }
+      const invoice = invoiceByReference.get(`Deposit - ${opp.id}`);
+      if (!invoice) continue; // no deposit invoice yet in Xero -- nothing to flag
+      if (Number(invoice.AmountDue ?? 0) > 0.01) continue; // genuinely not paid yet
+
+      stuck.push({
+        opportunityId: opp.id,
+        dealName: opp.name,
+        rep,
+        xeroInvoiceNumber: invoice.InvoiceNumber,
+        xeroAmountPaid: Number(invoice.AmountPaid ?? 0)
+      });
+    }
+
+    res.json({ count: stuck.length, stuck, checkFailedCount: checkFailed.length, checkFailed });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/admin/deposit-to-won', async (_req, res) => {
   try {
     const [allOpportunities, wonOpportunities, pipelines] = await Promise.all([
