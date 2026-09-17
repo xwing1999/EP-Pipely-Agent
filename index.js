@@ -1339,6 +1339,7 @@ app.get('/admin/invoice-check', async (_req, res) => {
         rep,
         stage,
         dealValue: o.monetaryValue,
+        contactEmail: o.contact?.email || null,
         hasInvoice: Boolean(invoice),
         invoiceNumber: invoice?.invoiceNumber ?? null,
         invoiceStatus: invoice?.status ?? null, // Pipely's own status — 'paid'/'sent'/'partially_paid' seen live
@@ -1450,13 +1451,82 @@ app.get('/admin/invoice-check', async (_req, res) => {
       c.statusMatchesXero = pipelyStatusMatchesXero(c.invoiceStatus, xeroInvoice);
     }
 
+    // Full invoice picture per deal, for a human "big scan" — per Xavier
+    // 2026-09-17: some deals are 50% deposit + 50% final, others are 100%
+    // upfront, decided as "a manual judgment call, not recorded anywhere"
+    // in Pipely. A manually-created 100%-upfront invoice in Xero won't
+    // carry either the "Deposit - <id>" or "Final Payment - <id>"
+    // Reference tag above, so it would be invisible to (and wrongly
+    // flagged missing by) the Reference-based check. Matched instead by
+    // CONTACT EMAIL — the same lookup findOrCreateXeroContactForPipely
+    // uses to invoice in the first place — so every real invoice for that
+    // customer shows up regardless of how it was created or what
+    // Reference it used. This does not try to auto-judge whether the
+    // total charged is "correct" (no rule exists to check that against);
+    // it just surfaces the real numbers for a human to eyeball. Batched:
+    // one Contacts lookup, one Invoices lookup, not one pair per deal.
+    const dealsWithEmail = checked.filter((c) => c.contactEmail);
+    const contactIdByEmail = new Map();
+    const invoicesByContactId = new Map();
+    let contactCheckError = null;
+    for (const batch of chunk([...new Set(dealsWithEmail.map((c) => c.contactEmail))], 10)) {
+      const clause = batch.map((email) => `EmailAddress=="${email}"`).join('||');
+      try {
+        const contactsResult = await xeroRequest('Contacts', { params: { where: `(${clause})` } });
+        for (const contact of contactsResult.Contacts ?? []) {
+          if (contact.EmailAddress) contactIdByEmail.set(contact.EmailAddress.toLowerCase(), contact.ContactID);
+        }
+      } catch (err) {
+        contactCheckError = err.message;
+      }
+    }
+    if (!contactCheckError) {
+      for (const batch of chunk([...new Set(contactIdByEmail.values())], 50)) {
+        try {
+          const invoicesResult = await xeroRequest('Invoices', { params: { ContactIDs: batch.join(',') } });
+          for (const inv of invoicesResult.Invoices ?? []) {
+            const cid = inv.Contact?.ContactID;
+            if (!cid) continue;
+            if (!invoicesByContactId.has(cid)) invoicesByContactId.set(cid, []);
+            invoicesByContactId.get(cid).push(inv);
+          }
+        } catch (err) {
+          contactCheckError = err.message;
+        }
+      }
+    }
+    for (const c of checked) {
+      if (!c.contactEmail) { c.xeroInvoicesForContact = null; continue; }
+      if (contactCheckError) {
+        c.xeroCheckError = c.xeroCheckError ? `${c.xeroCheckError}; ${contactCheckError}` : contactCheckError;
+        c.xeroInvoicesForContact = null;
+        continue;
+      }
+      const contactId = contactIdByEmail.get(c.contactEmail.toLowerCase());
+      const contactInvoices = contactId ? (invoicesByContactId.get(contactId) ?? []) : [];
+      c.xeroInvoicesForContact = contactInvoices
+        .filter((inv) => inv.Status !== 'VOIDED' && inv.Status !== 'DELETED')
+        .map((inv) => ({
+          reference: inv.Reference ?? null,
+          invoiceNumber: inv.InvoiceNumber,
+          total: Number(inv.Total ?? 0),
+          amountPaid: Number(inv.AmountPaid ?? 0),
+          amountDue: Number(inv.AmountDue ?? 0),
+          status: inv.Status
+        }));
+      c.xeroTotalInvoicedToContact = c.xeroInvoicesForContact.reduce((sum, inv) => sum + inv.total, 0);
+    }
+
     // The real problem list: a won-stage deal with NO invoice in Xero at
-    // all (checked by Reference, above) — not merely "Pipely has no
-    // invoice object", which is fine per Xavier. Strictly `=== false`, not
-    // just falsy — `null` means the Xero check itself failed (e.g. rate
-    // limit survived the retry in xeroRequest), and an unresolved check
-    // must never be reported as a confirmed "missing" finding.
-    const noInvoiceInXero = checked.filter((c) => c.xeroInvoiceExists === false);
+    // all — checked TWO ways before calling it missing: by our own
+    // Reference tag, AND by contact email (so a manually-created
+    // 100%-upfront invoice that skipped our Reference convention doesn't
+    // get wrongly flagged). Strictly `=== false` plus an empty contact
+    // invoice list, not just falsy — `null`/unresolved either check must
+    // never be reported as a confirmed "missing" finding.
+    const noInvoiceInXero = checked.filter((c) =>
+      c.xeroInvoiceExists === false && Array.isArray(c.xeroInvoicesForContact) && c.xeroInvoicesForContact.length === 0
+    );
     // Also real: Pipely shows an invoice, but that exact invoice doesn't
     // exist in Xero — Xavier: "if there is an invoice in pipely but not in
     // xero there is an issue."
