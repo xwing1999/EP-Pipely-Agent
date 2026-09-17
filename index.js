@@ -1263,6 +1263,60 @@ app.get('/admin/invoice-check', async (_req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// UNALLOCATED DEALS (added 2026-09-17) — Xavier: "we don't want to have a
+// client that does not have stock allocated somewhere." Cross-references
+// every tracked-pipeline WON-stage deal against stock-sheet-agent's
+// Automation Log (matched by External Ref == this deal's opportunity id)
+// — flags any deal with NO Automation Log entry at all, meaning nobody's
+// logged it / given it an allocation (On Shore / On Water / Next Custom
+// Order) yet. Computed fresh each call, not from any queue that depends on
+// the (currently paused) deposit webhook having fired — so it stays
+// correct even while automation is off and deals are being caught up by
+// hand.
+// ---------------------------------------------------------------------------
+app.get('/admin/unallocated-deals', async (_req, res) => {
+  try {
+    const [allOpportunities, pipelines, automationLogEntries] = await Promise.all([
+      fetchPipelyOpportunities(),
+      fetchPipelyPipelines(),
+      fetchAutomationLogEntries()
+    ]);
+
+    const wonStageLabelById = new Map();
+    for (const { id } of TRACKED_PIPELINES) {
+      const pipeline = pipelines.find((p) => p.id === id);
+      for (const s of pipeline?.stages ?? []) {
+        const label = normalizeWonStageLabel(s.name);
+        if (label) wonStageLabelById.set(s.id, label);
+      }
+    }
+
+    const loggedExternalRefs = new Set(automationLogEntries.map((e) => e['External Ref']).filter(Boolean));
+
+    const unallocated = [];
+    for (const o of allOpportunities) {
+      const stage = wonStageLabelById.get(o.pipelineStageId);
+      if (!stage) continue; // not far enough along to need an allocation yet
+      if (loggedExternalRefs.has(o.id)) continue; // already logged somewhere
+
+      const rep = TRACKED_PIPELINES.find((p) => p.id === o.pipelineId)?.rep;
+      unallocated.push({
+        opportunityId: o.id,
+        dealName: o.name,
+        rep,
+        stage,
+        dealValue: o.monetaryValue,
+        contactEmail: o.contact?.email || null
+      });
+    }
+
+    res.json({ count: unallocated.length, unallocated });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // DEPOSIT INVOICE WEBHOOK — intended trigger is a GoHighLevel Workflow
 // automation (configured in Pipely) that fires on the opportunity being
 // dragged into the "send deposit" pipeline stage, with this URL as a
