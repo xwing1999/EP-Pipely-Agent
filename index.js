@@ -895,6 +895,38 @@ app.get('/admin/pipelines', async (_req, res) => {
   }
 });
 
+// Diagnostic (added 2026-09-17) — Xavier asked to check what products are
+// actually offered in Pipely so the console's SKU dropdown can be
+// expanded to match. Two angles: (1) the location's custom field
+// definitions, in case a real "Product" picklist field exists (this is
+// the field resolveSkuFromOpportunity has been stubbed out waiting on,
+// per its comment above), and (2) real opportunity names + a sample of
+// full opportunity detail (customFields included), since product info
+// may just live in free-text deal names instead. Not a permanent
+// feature — remove once this question is answered.
+app.get('/admin/pipely-product-diagnostic', async (_req, res) => {
+  try {
+    const fieldsRes = await fetch(`${PIPELY_BASE_URL}/locations/${process.env.PIPELY_LOCATION_ID}/customFields`, {
+      headers: { Authorization: `Bearer ${process.env.PIPELY_API_KEY}`, Version: '2021-07-28' }
+    });
+    const customFieldsResult = fieldsRes.ok
+      ? await fieldsRes.json()
+      : { error: `${fieldsRes.status}: ${await fieldsRes.text()}` };
+
+    const opportunities = await fetchPipelyOpportunities();
+    const dealNames = opportunities.map((o) => o.name);
+
+    const sample = opportunities.slice(0, 5);
+    const sampleDetail = await Promise.all(
+      sample.map((o) => fetchPipelyOpportunity(o.id).catch((err) => ({ error: err.message, id: o.id })))
+    );
+
+    res.json({ customFieldsResult, dealNameCount: dealNames.length, dealNames, sampleDetail });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Diagnostic (added 2026-09-01) — raw Xero contact + invoices for one
 // email, to answer a real question that came up while testing: does Xero
 // actually have ANY invoices for deals Pipely shows as paid, or none at
