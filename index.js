@@ -124,10 +124,13 @@ async function getAccessToken() {
 // /admin/invoice-check's extra per-deal Xero lookups (checking Reference
 // directly for every won-stage deal, not just ones with a Pipely invoice)
 // started tripping Xero's rate limit across ~25 deals in one run. Honors
-// Xero's Retry-After header when present, falls back to 2s. A real,
-// non-429 error still throws immediately — this is only for the
-// "the server itself said to slow down" case, not a general retry-on-any-
-// -failure.
+// Xero's Retry-After header when present, but capped at 5s — Xero can
+// return a much larger Retry-After under sustained rate limiting, and
+// this is called synchronously from HTTP admin endpoints, not a background
+// job; a genuinely long wait belongs in a client-side retry, not a hung
+// request. A real, non-429 error still throws immediately — this is only
+// for the "the server itself said to slow down" case, not a general
+// retry-on-any-failure.
 async function xeroRequest(pathSegment, { method = 'GET', params, body, headers = {}, _retriesLeft = 1 } = {}) {
   const token = await getAccessToken();
   const url = new URL(pathSegment, 'https://api.xero.com/api.xro/2.0/');
@@ -144,7 +147,7 @@ async function xeroRequest(pathSegment, { method = 'GET', params, body, headers 
     body: body ? JSON.stringify(body) : undefined
   });
   if (res.status === 429 && _retriesLeft > 0) {
-    const retryAfterMs = (Number(res.headers.get('retry-after')) || 2) * 1000;
+    const retryAfterMs = Math.min((Number(res.headers.get('retry-after')) || 2) * 1000, 5000);
     await new Promise((resolve) => setTimeout(resolve, retryAfterMs));
     return xeroRequest(pathSegment, { method, params, body, headers, _retriesLeft: _retriesLeft - 1 });
   }
@@ -1236,6 +1239,22 @@ app.get('/admin/invoice-check', async (_req, res) => {
       });
     }
 
+    // Batch Xero into a handful of calls total, not one (or two) per deal —
+    // an earlier version of this endpoint made up to 2 sequential Xero
+    // requests PER checked deal (~35 calls for 25 deals), which reliably
+    // tripped Xero's rate limit. Worse, once xeroRequest grew a retry-on-
+    // 429 (honoring Xero's real Retry-After header, sometimes tens of
+    // seconds), those waits stacked sequentially across every call and
+    // made a single /admin/invoice-check request hang for minutes. Fixed
+    // by chunking: build the list of every Reference/InvoiceNumber this
+    // run needs up front, then fetch them in small batched `where`/
+    // InvoiceNumbers queries instead of one round-trip per deal.
+    function chunk(arr, size) {
+      const out = [];
+      for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+      return out;
+    }
+
     // Xero is the true accounting record — per Xavier 2026-09-17: "Xero is
     // the final resting place... the most important thing is that there is
     // an invoice in Xero. If there is an invoice in pipely but not in xero
@@ -1248,52 +1267,78 @@ app.get('/admin/invoice-check', async (_req, res) => {
     // falsely flagged plenty of deals that already had a perfectly real
     // Xero invoice, just because Pipely's native invoicing feature wasn't
     // also used for them.
+    const invoiceByReference = new Map();
+    let referenceCheckError = null;
+    const referencePairs = checked.map((c) => ({
+      opportunityId: c.opportunityId,
+      finalReference: `Final Payment - ${c.opportunityId}`,
+      depositReference: `Deposit - ${c.opportunityId}`
+    }));
+    // 10 deals = 20 References per query — comfortably under Xero's URL
+    // length limits while cutting a 25-deal run to ~3 calls instead of 25.
+    for (const batch of chunk(referencePairs, 10)) {
+      const clause = batch.map((p) => `Reference=="${p.finalReference}"||Reference=="${p.depositReference}"`).join('||');
+      try {
+        const result = await xeroRequest('Invoices', {
+          params: { where: `(${clause})&&Status!="VOIDED"&&Status!="DELETED"` }
+        });
+        for (const inv of result.Invoices ?? []) {
+          if (inv.Reference) invoiceByReference.set(inv.Reference, inv);
+        }
+      } catch (err) {
+        referenceCheckError = err.message;
+      }
+    }
     for (const c of checked) {
       const finalReference = `Final Payment - ${c.opportunityId}`;
       const depositReference = `Deposit - ${c.opportunityId}`;
-      // One combined query (OR'd references), not two separate calls — was
-      // originally two sequential requests per deal here, which (on top of
-      // the InvoiceNumbers lookup below) pushed a 25-deal run over Xero's
-      // rate limit. c.xeroInvoiceExists stays `null` (not `false`) if this
-      // errors out even after xeroRequest's own 429 retry, so a rate-limit
-      // hit is never reported as a real "no invoice in Xero" finding.
-      c.xeroInvoiceExists = null;
-      try {
-        const result = await xeroRequest('Invoices', {
-          params: { where: `(Reference=="${finalReference}"||Reference=="${depositReference}")&&Status!="VOIDED"&&Status!="DELETED"` }
-        });
-        const matches = result.Invoices ?? [];
-        const realInvoice = matches.find((inv) => inv.Reference === finalReference) ?? matches[0] ?? null;
-        c.xeroInvoiceExists = matches.length > 0;
-        c.xeroRealReference = realInvoice?.Reference ?? null;
-        c.xeroRealInvoiceNumber = realInvoice?.InvoiceNumber ?? null;
-        c.xeroRealStatus = realInvoice?.Status ?? null;
-      } catch (err) {
-        c.xeroCheckError = err.message;
+      if (referenceCheckError) {
+        // The batch(es) covering this deal may not have run at all if an
+        // earlier batch failed — null (not false) means "unresolved this
+        // run", never reported as a confirmed missing-invoice finding.
+        c.xeroInvoiceExists = null;
+        c.xeroCheckError = referenceCheckError;
+        continue;
       }
+      const realInvoice = invoiceByReference.get(finalReference) ?? invoiceByReference.get(depositReference) ?? null;
+      c.xeroInvoiceExists = Boolean(realInvoice);
+      c.xeroRealReference = realInvoice?.Reference ?? null;
+      c.xeroRealInvoiceNumber = realInvoice?.InvoiceNumber ?? null;
+      c.xeroRealStatus = realInvoice?.Status ?? null;
     }
 
     // Separate check: where Pipely DOES have its own native invoice, does
     // its exact InvoiceNumber actually exist in Xero, and does its status
-    // agree with Xero's? Sequential, not parallel — this list stays small
-    // (currently single digits) since it's already narrowed to tracked
-    // pipelines' WON stages; not worth the complexity of batching via
-    // Xero's InvoiceNumbers= param at this scale.
+    // agree with Xero's? Xero's InvoiceNumbers param already accepts a
+    // comma-separated batch — one call for every Pipely-linked invoice
+    // number this run needs, not one call per deal.
+    const dealsWithPipelyInvoice = checked.filter((c) => c._xeroInvoiceNumber);
+    const invoiceByNumber = new Map();
+    let numberCheckError = null;
+    for (const batch of chunk([...new Set(dealsWithPipelyInvoice.map((c) => c._xeroInvoiceNumber))], 50)) {
+      try {
+        const xeroResult = await xeroRequest('Invoices', { params: { InvoiceNumbers: batch.join(',') } });
+        for (const inv of xeroResult.Invoices ?? []) {
+          if (inv.InvoiceNumber) invoiceByNumber.set(inv.InvoiceNumber, inv);
+        }
+      } catch (err) {
+        numberCheckError = err.message;
+      }
+    }
     for (const c of checked) {
       const xeroInvoiceNumber = c._xeroInvoiceNumber;
       delete c._xeroInvoiceNumber;
       if (!xeroInvoiceNumber) continue;
-      try {
-        const xeroResult = await xeroRequest('Invoices', { params: { InvoiceNumbers: xeroInvoiceNumber } });
-        const xeroInvoice = xeroResult.Invoices?.[0] ?? null;
-        c.xeroInvoiceNumber = xeroInvoiceNumber;
-        c.xeroFound = Boolean(xeroInvoice);
-        c.xeroStatus = xeroInvoice?.Status ?? null;
-        c.xeroAmountDue = xeroInvoice ? Number(xeroInvoice.AmountDue ?? 0) : null;
-        c.statusMatchesXero = pipelyStatusMatchesXero(c.invoiceStatus, xeroInvoice);
-      } catch (err) {
-        c.xeroCheckError = c.xeroCheckError ? `${c.xeroCheckError}; ${err.message}` : err.message;
+      if (numberCheckError) {
+        c.xeroCheckError = c.xeroCheckError ? `${c.xeroCheckError}; ${numberCheckError}` : numberCheckError;
+        continue;
       }
+      const xeroInvoice = invoiceByNumber.get(xeroInvoiceNumber) ?? null;
+      c.xeroInvoiceNumber = xeroInvoiceNumber;
+      c.xeroFound = Boolean(xeroInvoice);
+      c.xeroStatus = xeroInvoice?.Status ?? null;
+      c.xeroAmountDue = xeroInvoice ? Number(xeroInvoice.AmountDue ?? 0) : null;
+      c.statusMatchesXero = pipelyStatusMatchesXero(c.invoiceStatus, xeroInvoice);
     }
 
     // The real problem list: a won-stage deal with NO invoice in Xero at
