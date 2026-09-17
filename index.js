@@ -1156,9 +1156,11 @@ app.get('/admin/deposit-to-won', async (_req, res) => {
 //   Xero was first connected.
 //
 // Known real gap: not every Pipely invoice has `opportunityDetails` set
-// (the Tess Gleeson one above has it null) — so hasInvoice/missingInvoice
-// below can undercount if an invoice exists but was never linked back to
-// its opportunity in Pipely. Flagged here rather than silently trusted.
+// (the Tess Gleeson one above has it null) — so hasInvoice below can
+// undercount if an invoice exists but was never linked back to its
+// opportunity in Pipely. Flagged here rather than silently trusted. This
+// does NOT affect the noInvoiceInXero check (see below), which looks at
+// Xero directly rather than trusting Pipely's own invoice object.
 // ---------------------------------------------------------------------------
 function pipelyStatusMatchesXero(pipelyStatus, xeroInvoice) {
   if (!xeroInvoice) return false;
@@ -1221,8 +1223,39 @@ app.get('/admin/invoice-check', async (_req, res) => {
       });
     }
 
-    // Cross-check each matched invoice against Xero, by the confirmed
-    // InvoiceNumber key. Sequential, not parallel — this list stays small
+    // Xero is the true accounting record — per Xavier 2026-09-17: "Xero is
+    // the final resting place... the most important thing is that there is
+    // an invoice in Xero. If there is an invoice in pipely but not in xero
+    // there is an issue. If one is in xero but not in pipely this is ok."
+    // So the real "missing invoice" check is against Xero directly, by the
+    // exact Reference this agent itself invoices under (see
+    // createDepositInvoiceLocked/createFinalInvoiceLocked) — NOT against
+    // whether Pipely's own separate invoice object happens to exist. The
+    // old version keyed entirely off Pipely's hasInvoice flag, which
+    // falsely flagged plenty of deals that already had a perfectly real
+    // Xero invoice, just because Pipely's native invoicing feature wasn't
+    // also used for them.
+    for (const c of checked) {
+      const finalReference = `Final Payment - ${c.opportunityId}`;
+      const depositReference = `Deposit - ${c.opportunityId}`;
+      try {
+        const finalMatch = await xeroRequest('Invoices', { params: { where: `Reference=="${finalReference}"&&Status!="VOIDED"&&Status!="DELETED"` } });
+        const depositMatch = finalMatch.Invoices?.length
+          ? null
+          : await xeroRequest('Invoices', { params: { where: `Reference=="${depositReference}"&&Status!="VOIDED"&&Status!="DELETED"` } });
+        const realInvoice = finalMatch.Invoices?.[0] ?? depositMatch?.Invoices?.[0] ?? null;
+        c.xeroInvoiceExists = Boolean(realInvoice);
+        c.xeroRealReference = realInvoice?.Reference ?? null;
+        c.xeroRealInvoiceNumber = realInvoice?.InvoiceNumber ?? null;
+        c.xeroRealStatus = realInvoice?.Status ?? null;
+      } catch (err) {
+        c.xeroCheckError = err.message;
+      }
+    }
+
+    // Separate check: where Pipely DOES have its own native invoice, does
+    // its exact InvoiceNumber actually exist in Xero, and does its status
+    // agree with Xero's? Sequential, not parallel — this list stays small
     // (currently single digits) since it's already narrowed to tracked
     // pipelines' WON stages; not worth the complexity of batching via
     // Xero's InvoiceNumbers= param at this scale.
@@ -1239,18 +1272,24 @@ app.get('/admin/invoice-check', async (_req, res) => {
         c.xeroAmountDue = xeroInvoice ? Number(xeroInvoice.AmountDue ?? 0) : null;
         c.statusMatchesXero = pipelyStatusMatchesXero(c.invoiceStatus, xeroInvoice);
       } catch (err) {
-        c.xeroCheckError = err.message;
+        c.xeroCheckError = c.xeroCheckError ? `${c.xeroCheckError}; ${err.message}` : err.message;
       }
     }
 
-    const missingInvoice = checked.filter((c) => !c.hasInvoice);
-    const statusMismatch = checked.filter((c) => c.hasInvoice && c.statusMatchesXero === false);
+    // The real problem list: a won-stage deal with NO invoice in Xero at
+    // all (checked by Reference, above) — not merely "Pipely has no
+    // invoice object", which is fine per Xavier.
+    const noInvoiceInXero = checked.filter((c) => !c.xeroInvoiceExists);
+    // Also real: Pipely shows an invoice, but that exact invoice doesn't
+    // exist in Xero — Xavier: "if there is an invoice in pipely but not in
+    // xero there is an issue."
     const notFoundInXero = checked.filter((c) => c.hasInvoice && c.xeroFound === false);
+    const statusMismatch = checked.filter((c) => c.hasInvoice && c.statusMatchesXero === false);
 
     res.json({
       count: checked.length,
-      missingInvoiceCount: missingInvoice.length,
-      missingInvoice,
+      noInvoiceInXeroCount: noInvoiceInXero.length,
+      noInvoiceInXero,
       statusMismatchCount: statusMismatch.length,
       statusMismatch,
       notFoundInXeroCount: notFoundInXero.length,
