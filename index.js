@@ -1613,9 +1613,20 @@ app.get('/admin/invoice-check', async (_req, res) => {
 // either), and only writes to OUR OWN spreadsheet cache tab — not the kind
 // of edit PAUSE_AUTOMATION exists to gate (that's about writes to Xero/
 // Pipely, external systems of record). Runs regardless of the pause, same
-// as the existing (also read-only) reconciliation job.
+// as the old (now-disabled) reconciliation job used to.
+//
+// Interval raised 15 -> 90 minutes 2026-09-20 — confirmed via Xero's own
+// X-Rate-Limit-Problem response header that the persistent 429s across
+// multiple days were hitting the DAILY cap specifically, not a per-minute
+// throttle that clears itself in seconds. At 15 minutes this job alone
+// runs 96x/day; at ~8-10 Xero calls per run that's 750-950 calls/day on
+// background scanning alone, before any real interactive use or manual
+// re-scans. 90 minutes cuts that to ~16x/day (~130-160 calls/day),
+// leaving real daily headroom. A daily cap resets once every 24h, not
+// instantly, so this took a real diagnostic to catch — reducing our own
+// consumption is what actually fixes it, not waiting it out.
 // ---------------------------------------------------------------------------
-const PAYMENT_AUDIT_CACHE_INTERVAL_MINUTES = Number(process.env.PAYMENT_AUDIT_CACHE_INTERVAL_MINUTES ?? 15);
+const PAYMENT_AUDIT_CACHE_INTERVAL_MINUTES = Number(process.env.PAYMENT_AUDIT_CACHE_INTERVAL_MINUTES ?? 90);
 
 function summarizeXeroInvoices(invoices) {
   if (!invoices || !invoices.length) return 'None found';
