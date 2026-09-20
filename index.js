@@ -152,7 +152,14 @@ async function xeroRequest(pathSegment, { method = 'GET', params, body, headers 
     return xeroRequest(pathSegment, { method, params, body, headers, _retriesLeft: _retriesLeft - 1 });
   }
   if (!res.ok) {
-    throw new Error(`Xero API error ${res.status} on ${method} ${pathSegment}: ${await res.text()}`);
+    // On a 429, Xero's X-Rate-Limit-Problem header says WHICH limit was
+    // hit (minute/day/concurrent/app-minute) — added 2026-09-20 after
+    // rate limiting persisted for days even once background load was cut
+    // way down, to find out whether this is a short-lived per-minute
+    // throttle or a much slower-to-clear daily/app-wide cap.
+    const rateLimitProblem = res.headers.get('x-rate-limit-problem');
+    const suffix = rateLimitProblem ? ` [X-Rate-Limit-Problem: ${rateLimitProblem}]` : '';
+    throw new Error(`Xero API error ${res.status} on ${method} ${pathSegment}: ${await res.text()}${suffix}`);
   }
   // Some endpoints (e.g. Invoices/{id}/Email) return 204 with an empty body
   // on success — res.json() throws on that. Read as text first.
