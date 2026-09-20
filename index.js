@@ -1422,6 +1422,17 @@ async function computeInvoiceCheck() {
       c.xeroRealReference = realInvoice?.Reference ?? null;
       c.xeroRealInvoiceNumber = realInvoice?.InvoiceNumber ?? null;
       c.xeroRealStatus = realInvoice?.Status ?? null;
+
+      // Specifically the DEPOSIT invoice (not "whichever of final/deposit
+      // exists" above) — needed to detect a deal stuck at "Deposit Invoice
+      // Sent" in Pipely despite Xero showing the deposit already paid. See
+      // "STUCK AT DEPOSIT INVOICE SENT" below, folded into this same
+      // batched check 2026-09-20 so Needs Attention never has to trigger
+      // its own separate live Xero call just to load.
+      const depositInvoice = invoiceByReference.get(depositReference) ?? null;
+      c.xeroDepositAmountDue = depositInvoice ? Number(depositInvoice.AmountDue ?? 0) : null;
+      c.xeroDepositInvoiceNumber = depositInvoice?.InvoiceNumber ?? null;
+      c.xeroDepositAmountPaid = depositInvoice ? Number(depositInvoice.AmountPaid ?? 0) : null;
     }
 
     // Separate check: where Pipely DOES have its own native invoice, does
@@ -1543,6 +1554,16 @@ async function computeInvoiceCheck() {
     // real finding either way, surfaced separately so it isn't silently
     // dropped or miscounted as a pass or a fail.
     const checkFailed = checked.filter((c) => c.xeroCheckError);
+    // Stuck at "Deposit Invoice Sent" in Pipely despite Xero showing the
+    // deposit already paid — folded in from the old standalone
+    // /admin/stuck-deposit-paid endpoint 2026-09-20, per Xavier: "the api
+    // should be checking and then logging on the spreadsheet and not
+    // calling the whole system everytime." Same data this endpoint's own
+    // batched Reference check already computes, just filtered
+    // differently — no extra Xero calls for it.
+    const stuckDepositPaid = checked.filter((c) =>
+      c.stage === 'Deposit Invoice Sent' && c.xeroDepositInvoiceNumber && (c.xeroDepositAmountDue ?? 1) <= 0.01
+    );
 
     return {
       count: checked.length,
@@ -1554,6 +1575,8 @@ async function computeInvoiceCheck() {
       notFoundInXero,
       checkFailedCount: checkFailed.length,
       checkFailed,
+      stuckDepositPaidCount: stuckDepositPaid.length,
+      stuckDepositPaid,
       deals: checked
     };
 }
@@ -1621,7 +1644,10 @@ async function refreshPaymentAuditCache() {
     xeroCheckError: d.xeroCheckError || '',
     xeroInvoicesSummary: summarizeXeroInvoices(d.xeroInvoicesForContact),
     xeroInvoicesForContact: d.xeroInvoicesForContact || [],
-    xeroTotalInvoicedToContact: d.xeroTotalInvoicedToContact ?? ''
+    xeroTotalInvoicedToContact: d.xeroTotalInvoicedToContact ?? '',
+    stuckDepositPaid: result.stuckDepositPaid.some((x) => x.opportunityId === d.opportunityId),
+    xeroDepositInvoiceNumber: d.xeroDepositInvoiceNumber || '',
+    xeroDepositAmountPaid: d.xeroDepositAmountPaid ?? ''
   }));
 
   const res = await fetch(`${process.env.STOCK_SHEET_AGENT_URL}/admin/write-payment-audit-cache`, {
