@@ -814,18 +814,23 @@ async function runReconciliation() {
   return mismatches;
 }
 
+// Disabled 2026-09-20 — this job was found running unconditionally every
+// hour (CHECK_INTERVAL_MINUTES default 60), making up to ~50 real Xero API
+// calls per run (2 sequential calls -- Contacts + Invoices -- per
+// tracked-pipeline opportunity, one at a time, no batching) for a check
+// this project's own comments already call "known unreliable" and
+// superseded by /admin/invoice-check back on 2026-09-01. Nothing in the
+// console links to /admin/mismatches anymore. Left running continuously
+// for weeks, this was very likely the dominant contributor to the
+// persistent Xero 429 rate-limiting that made both invoice-check and the
+// Payment Audit cache unable to get a clean read (Xavier: "heaps of
+// errors with the ai stuff here?"). The endpoint and runReconciliation()
+// itself are untouched -- /admin/run-check and /admin/mismatches still
+// work on demand -- only the automatic hourly re-run is removed.
 let reconciliationTimer = null;
 function scheduleReconciliation() {
-  const intervalMinutes = Number(process.env.CHECK_INTERVAL_MINUTES ?? 60);
-  // Run once immediately on startup — otherwise /admin/mismatches reads as
-  // "nothing wrong" for up to a full interval, which looks identical to
-  // "checked, all clean" even though nothing has actually run yet. Also
-  // covers the case where Xero OAuth hasn't been completed yet at boot
-  // (throws, gets caught, logged, and the schedule still proceeds normally).
-  runReconciliation().catch((err) => console.error('Initial reconciliation run failed:', err.message));
-  reconciliationTimer = setInterval(() => {
-    runReconciliation().catch((err) => console.error('Scheduled reconciliation run failed:', err.message));
-  }, intervalMinutes * 60 * 1000);
+  // Intentionally not called. Kept as a function (not deleted) in case a
+  // manual scheduled re-check is ever wanted again with real batching.
 }
 scheduleReconciliation();
 
