@@ -1750,7 +1750,9 @@ function matchUnitRow(o, units) {
   for (const u of units) {
     const contact = (u.contact || '').toLowerCase();
     if (email && contact.includes(email)) return { unit: u, matchedBy: 'email' };
-    if (phone && lastDigits(contact) === phone) return { unit: u, matchedBy: 'phone' };
+    // Contact can hold "phone · email" — check each part so digits in an
+    // email address can't corrupt the phone comparison.
+    if (phone && contact.split(/[·,;/|]/).some((part) => !part.includes('@') && lastDigits(part) === phone)) return { unit: u, matchedBy: 'phone' };
   }
   for (const u of units) {
     const who = normalizeName(u.allocatedTo);
@@ -1798,6 +1800,7 @@ async function computeUnallocatedDeals() {
         stage,
         dealValue: o.monetaryValue,
         contactEmail: o.contact?.email || null,
+        contactPhone: o.contact?.phone || null,
         contactName: o.contact?.name || [o.contact?.firstName, o.contact?.lastName].filter(Boolean).join(' ') || null
       };
       const match = matchUnitRow(o, allocatedUnits);
