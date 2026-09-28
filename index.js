@@ -577,6 +577,10 @@ async function notifyFinalInvoiceCreated(opportunity, invoice) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.STOCK_SHEET_AGENT_API_KEY },
       body: JSON.stringify({ externalRef: opportunity.id, status: 'Invoiced' })
+    }).then(async (r) => {
+      // A non-2xx (e.g. no Automation Log entry with this External Ref)
+      // used to pass silently, leaving the order stuck on "Send final invoice".
+      if (!r.ok) console.error(`Opportunity ${opportunity.id}: stock sheet rejected final payment status (${r.status}): ${await r.text()}`);
     }).catch((err) => console.error(`Opportunity ${opportunity.id}: failed to set final payment status on stock sheet:`, err.message));
   }
 }
