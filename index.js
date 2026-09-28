@@ -1755,8 +1755,7 @@ function matchUnitRow(o, units) {
   return null;
 }
 
-app.get('/admin/unallocated-deals', async (_req, res) => {
-  try {
+async function computeUnallocatedDeals() {
     const [allOpportunities, pipelines, automationLogEntries, unitResult] = await Promise.all([
       fetchPipelyOpportunities(),
       fetchPipelyPipelines(),
@@ -1794,7 +1793,8 @@ app.get('/admin/unallocated-deals', async (_req, res) => {
         rep,
         stage,
         dealValue: o.monetaryValue,
-        contactEmail: o.contact?.email || null
+        contactEmail: o.contact?.email || null,
+        contactName: o.contact?.name || [o.contact?.firstName, o.contact?.lastName].filter(Boolean).join(' ') || null
       };
       const match = matchUnitRow(o, allocatedUnits);
       if (match?.matchedBy === 'name') {
@@ -1805,12 +1805,126 @@ app.get('/admin/unallocated-deals', async (_req, res) => {
       unallocated.push(deal);
     }
 
-    res.json({
+    return {
       count: unallocated.length,
       unallocated,
       allocatedByNameOnly,
       ...(unitResult.error ? { unitRowsError: `Couldn't read the unit tabs, so sheet-only allocations weren't checked: ${unitResult.error}` } : {})
+    };
+}
+
+app.get('/admin/unallocated-deals', async (_req, res) => {
+  try {
+    res.json(await computeUnallocatedDeals());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// SUGGESTED ALLOCATIONS (2026-09-28) — Xavier didn't want 19 won deals keyed
+// in one by one. For each unallocated won deal: read its Xero invoice line
+// items (invoice numbers from the Payment Audit Cache), match the line
+// description to a SKU by product family + size, and suggest the first
+// location with a free unit of that SKU (Stock On Shore, then batches in
+// order, else Next Custom Order). Read-only — the console shows these for
+// a human to adjust, then logs each one through the normal Log Sale path.
+// ---------------------------------------------------------------------------
+const PRODUCT_FAMILIES = ['obsidian', 'onyx', 'redlight', 'sienna', 'traditional', 'vulcan', 'nordic', 'cedar', 'ice forge', 'cold plunge'];
+
+function familyOf(text) {
+  const t = (text || '').toLowerCase().replace(/red\s+light/g, 'redlight');
+  return PRODUCT_FAMILIES.find((f) => t.includes(f)) || null;
+}
+function sizeOf(text) {
+  const t = (text || '').toLowerCase();
+  const range = t.match(/(\d)\s*[-–to]+\s*(\d)\s*(p\b|person|people|seat)/);
+  if (range) return `${range[1]}-${range[2]}`;
+  const single = t.match(/(\d)\s*(p\b|person|people|seat)/);
+  return single ? single[1] : null;
+}
+
+function matchSku(description, catalog) {
+  const family = familyOf(description);
+  if (!family) return null;
+  const size = sizeOf(description);
+  const candidates = catalog.filter((c) => familyOf(c.product) === family);
+  const exact = size && candidates.find((c) => sizeOf(`${c.modelSize} person`) === size);
+  if (exact) return { sku: exact.sku, confidence: 'high' };
+  if (candidates.length === 1) return { sku: candidates[0].sku, confidence: 'low' };
+  return null;
+}
+
+async function fetchStockSheetJson(pathSegment) {
+  const res = await fetch(`${process.env.STOCK_SHEET_AGENT_URL}${pathSegment}`, { headers: { 'x-api-key': process.env.STOCK_SHEET_AGENT_API_KEY } });
+  if (!res.ok) throw new Error(`Stock sheet agent error ${res.status} on ${pathSegment}: ${await res.text()}`);
+  return res.json();
+}
+
+app.get('/admin/suggest-allocations', async (_req, res) => {
+  try {
+    const [{ unallocated }, unitStock, cache] = await Promise.all([
+      computeUnallocatedDeals(),
+      fetchStockSheetJson('/admin/unit-stock'),
+      fetchStockSheetJson('/admin/payment-audit-cache').catch(() => ({ deals: [] }))
+    ]);
+
+    const invoiceNumbersByOpp = new Map();
+    for (const d of cache.deals ?? []) {
+      const nums = ((d.xeroInvoicesSummary || '') + ' ' + (d.xeroInvoiceNumber || '')).match(/INV-\d+/g) || [];
+      invoiceNumbersByOpp.set(d.opportunityId, [...new Set(nums)]);
+    }
+
+    // Line items only come back on a paged Invoices request.
+    const allNumbers = [...new Set(unallocated.flatMap((d) => invoiceNumbersByOpp.get(d.opportunityId) || []))];
+    const invoiceByNumber = new Map();
+    let xeroError = null;
+    for (let i = 0; i < allNumbers.length; i += 50) {
+      try {
+        const r = await xeroRequest('Invoices', { params: { InvoiceNumbers: allNumbers.slice(i, i + 50).join(','), page: 1 } });
+        for (const inv of r.Invoices ?? []) invoiceByNumber.set(inv.InvoiceNumber, inv);
+      } catch (err) { xeroError = err.message; }
+    }
+
+    const catalog = [];
+    for (const t of unitStock.tabs ?? []) for (const p of t.products) if (!catalog.some((c) => c.sku === p.sku)) catalog.push(p);
+    // Free units left per (tab, sku), decremented as suggestions are made so
+    // two deals aren't both pointed at the same last unit.
+    const free = new Map();
+    for (const t of unitStock.tabs ?? []) for (const p of t.products) free.set(`${t.tabName}|${p.sku}`, p.available);
+
+    const suggestions = unallocated.map((d) => {
+      const lines = (invoiceNumbersByOpp.get(d.opportunityId) || [])
+        .flatMap((n) => (invoiceByNumber.get(n)?.LineItems ?? []).map((li) => ({ invoice: n, description: li.Description || li.Item?.Name || '', quantity: li.Quantity })));
+      const productLine = lines.map((l) => ({ ...l, match: matchSku(l.description, catalog) })).find((l) => l.match);
+      const sku = productLine?.match.sku || null;
+      const quantity = Math.max(1, Math.round(Number(productLine?.quantity) || 1));
+
+      let allocation = null, batchReference = null;
+      if (sku) {
+        const tab = (unitStock.tabs ?? []).find((t) => t.stage !== 'Next Custom Order' && (free.get(`${t.tabName}|${sku}`) || 0) >= quantity);
+        if (tab) {
+          free.set(`${tab.tabName}|${sku}`, free.get(`${tab.tabName}|${sku}`) - quantity);
+          allocation = tab.stage;
+          batchReference = tab.batch;
+        } else {
+          allocation = 'Next Custom Order';
+        }
+      }
+      return {
+        ...d,
+        invoiceLines: lines,
+        suggestedSku: sku,
+        skuConfidence: productLine?.match.confidence || null,
+        quantity,
+        suggestedAllocation: allocation,
+        suggestedBatch: batchReference,
+        note: !lines.length ? 'No Xero invoice line items found — pick the product by hand.'
+          : !sku ? 'Invoice lines didn\'t name a known product — pick by hand.' : null
+      };
     });
+
+    res.json({ suggestions, catalog, ...(xeroError ? { xeroError } : {}) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
