@@ -1775,6 +1775,9 @@ app.get('/admin/unallocated-deals', async (_req, res) => {
     }
 
     const loggedExternalRefs = new Set(automationLogEntries.map((e) => e['External Ref']).filter(Boolean));
+    // Entries logged by hand without an External Ref (before the Log Sale
+    // form had a Pipely-deal picker) still count, matched by email.
+    const loggedEmails = new Set(automationLogEntries.map((e) => (e['Email'] || '').trim().toLowerCase()).filter(Boolean));
 
     const unallocated = [];
     const allocatedByNameOnly = [];
@@ -1782,6 +1785,7 @@ app.get('/admin/unallocated-deals', async (_req, res) => {
       const stage = wonStageLabelById.get(o.pipelineStageId);
       if (!stage) continue; // not far enough along to need an allocation yet
       if (loggedExternalRefs.has(o.id)) continue; // already logged somewhere
+      if (o.contact?.email && loggedEmails.has(o.contact.email.trim().toLowerCase())) continue;
 
       const rep = TRACKED_PIPELINES.find((p) => p.id === o.pipelineId)?.rep;
       const deal = {
