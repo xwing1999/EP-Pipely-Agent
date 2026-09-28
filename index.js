@@ -329,6 +329,41 @@ async function fetchPipelyInvoices() {
   return all;
 }
 
+// Pipely (GoHighLevel) product catalogue + prices — read-only, used to seed
+// SKUs in the stock sheet (2026-09-28). GHL Products API:
+// GET /products/?locationId= and GET /products/{id}/price?locationId=.
+async function fetchPipelyProducts() {
+  const headers = { Authorization: `Bearer ${process.env.PIPELY_API_KEY}`, Version: '2021-07-28' };
+  const all = [];
+  for (let page = 0; page < 10; page++) {
+    const params = new URLSearchParams({ locationId: process.env.PIPELY_LOCATION_ID, limit: '100', offset: String(page * 100) });
+    const res = await fetch(`${PIPELY_BASE_URL}/products/?${params}`, { headers });
+    if (!res.ok) throw new Error(`Pipely products error ${res.status}: ${await res.text()}`);
+    const data = await res.json();
+    const batch = data.products ?? data.data ?? [];
+    all.push(...batch);
+    if (batch.length < 100) break;
+  }
+  const out = [];
+  for (const p of all) {
+    let prices = [];
+    try {
+      const r = await fetch(`${PIPELY_BASE_URL}/products/${p._id || p.id}/price?locationId=${process.env.PIPELY_LOCATION_ID}`, { headers });
+      if (r.ok) prices = ((await r.json()).prices ?? []).map((x) => ({ name: x.name, amount: x.amount, currency: x.currency, type: x.type }));
+    } catch { /* price lookup is best-effort */ }
+    out.push({ id: p._id || p.id, name: p.name, description: (p.description || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 300), productType: p.productType, prices });
+  }
+  return out;
+}
+
+app.get('/admin/pipely-products', async (_req, res) => {
+  try {
+    res.json({ products: await fetchPipelyProducts() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 async function fetchPipelyContact(contactId) {
   const res = await fetch(`${PIPELY_BASE_URL}/contacts/${contactId}`, {
     headers: { Authorization: `Bearer ${process.env.PIPELY_API_KEY}`, Version: '2021-07-28' }
