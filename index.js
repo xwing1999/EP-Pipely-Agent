@@ -626,6 +626,18 @@ async function fetchAutomationLogEntries() {
   return data.entries ?? [];
 }
 
+// Every unit row across the stage tabs (Stock On Shore, batches, Next
+// Custom Order) — including customers typed straight into the sheet.
+async function fetchUnitRows() {
+  if (!process.env.STOCK_SHEET_AGENT_URL) throw new Error('STOCK_SHEET_AGENT_URL not configured');
+  const res = await fetch(`${process.env.STOCK_SHEET_AGENT_URL}/admin/unit-stock`, {
+    headers: { 'x-api-key': process.env.STOCK_SHEET_AGENT_API_KEY }
+  });
+  if (!res.ok) throw new Error(`Stock sheet agent error ${res.status} on /admin/unit-stock: ${await res.text()}`);
+  const data = await res.json();
+  return (data.tabs ?? []).flatMap((t) => t.units.map((u) => ({ ...u, tabName: t.tabName })));
+}
+
 function daysUntil(dateStr) {
   const target = new Date(dateStr);
   if (isNaN(target.getTime())) return null;
@@ -1707,13 +1719,51 @@ app.post('/admin/refresh-payment-audit-cache', async (_req, res) => {
 // correct even while automation is off and deals are being caught up by
 // hand.
 // ---------------------------------------------------------------------------
+//
+// EXTENDED 2026-09-28 — deals were showing as unallocated even though Nancy
+// had put the customer on a unit row directly in the sheet (no Automation
+// Log entry, so no External Ref). Now also checks every unit row: a deal
+// counts as allocated if a unit row's Contact holds its email or phone
+// (last 8 digits), or its Allocated To matches the contact / deal name.
+// Name-only matches are returned separately in `allocatedByNameOnly` so
+// they can be sanity-checked — names are the weakest of the three signals.
+function normalizeName(s) {
+  return (s || '').toString().toLowerCase().replace(/[^a-z\s]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+function lastDigits(s, n = 8) {
+  const d = (s || '').toString().replace(/\D/g, '');
+  return d.length >= n ? d.slice(-n) : null;
+}
+
+function matchUnitRow(o, units) {
+  const email = (o.contact?.email || '').toLowerCase();
+  const phone = lastDigits(o.contact?.phone);
+  const names = [
+    o.contact?.name,
+    [o.contact?.firstName, o.contact?.lastName].filter(Boolean).join(' '),
+    o.name
+  ].map(normalizeName).filter((n) => n.includes(' ')); // full names only — a lone first name is too loose
+  for (const u of units) {
+    const contact = (u.contact || '').toLowerCase();
+    if (email && contact.includes(email)) return { unit: u, matchedBy: 'email' };
+    if (phone && lastDigits(contact) === phone) return { unit: u, matchedBy: 'phone' };
+  }
+  for (const u of units) {
+    const who = normalizeName(u.allocatedTo);
+    if (who && names.some((n) => who === n || who.includes(n))) return { unit: u, matchedBy: 'name' };
+  }
+  return null;
+}
+
 app.get('/admin/unallocated-deals', async (_req, res) => {
   try {
-    const [allOpportunities, pipelines, automationLogEntries] = await Promise.all([
+    const [allOpportunities, pipelines, automationLogEntries, unitResult] = await Promise.all([
       fetchPipelyOpportunities(),
       fetchPipelyPipelines(),
-      fetchAutomationLogEntries()
+      fetchAutomationLogEntries(),
+      fetchUnitRows().then((units) => ({ units }), (err) => ({ units: [], error: err.message }))
     ]);
+    const allocatedUnits = unitResult.units.filter((u) => u.allocated);
 
     const wonStageLabelById = new Map();
     for (const { id } of TRACKED_PIPELINES) {
@@ -1727,23 +1777,36 @@ app.get('/admin/unallocated-deals', async (_req, res) => {
     const loggedExternalRefs = new Set(automationLogEntries.map((e) => e['External Ref']).filter(Boolean));
 
     const unallocated = [];
+    const allocatedByNameOnly = [];
     for (const o of allOpportunities) {
       const stage = wonStageLabelById.get(o.pipelineStageId);
       if (!stage) continue; // not far enough along to need an allocation yet
       if (loggedExternalRefs.has(o.id)) continue; // already logged somewhere
 
       const rep = TRACKED_PIPELINES.find((p) => p.id === o.pipelineId)?.rep;
-      unallocated.push({
+      const deal = {
         opportunityId: o.id,
         dealName: o.name,
         rep,
         stage,
         dealValue: o.monetaryValue,
         contactEmail: o.contact?.email || null
-      });
+      };
+      const match = matchUnitRow(o, allocatedUnits);
+      if (match?.matchedBy === 'name') {
+        allocatedByNameOnly.push({ ...deal, unitTab: match.unit.tabName, unitSku: match.unit.sku, allocatedTo: match.unit.allocatedTo });
+        continue;
+      }
+      if (match) continue; // on a unit row, matched by email/phone
+      unallocated.push(deal);
     }
 
-    res.json({ count: unallocated.length, unallocated });
+    res.json({
+      count: unallocated.length,
+      unallocated,
+      allocatedByNameOnly,
+      ...(unitResult.error ? { unitRowsError: `Couldn't read the unit tabs, so sheet-only allocations weren't checked: ${unitResult.error}` } : {})
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
